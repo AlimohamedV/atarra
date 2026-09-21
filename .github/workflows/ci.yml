@@ -1,0 +1,172 @@
+name: CI
+
+# Runs on every push so a broken commit is caught by the machine rather than by
+# whoever opens the dashboard next.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A newer push supersedes an older run: no point spending runner minutes proving a
+# commit that is already out of date.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Offline test suite. No network, no GPU, deterministic.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Offline suite (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned to 3.11, not 3.12+. pyproject declares `>=3.11,<3.12` because the
+          # geospatial wheel set (rasterio/GDAL bindings) is only reliably available
+          # for 3.11 here, and CI should match the declared support range rather
+          # than quietly test an unsupported interpreter.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+
+      - name: Install build tooling
+        # `--no-build-isolation` below needs these already present.
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+
+      # CPU-only PyTorch, from PyTorch's own index.
+      #
+      # This step is load-bearing rather than a nicety. Every torch-dependent test
+      # guards itself with `pytest.importorskip("torch")`, so without torch the
+      # entire model, dataset, and trainer suite would *skip* and the job would go
+      # green having validated none of the project's core machine learning. The
+      # `Fail if any test skipped` step below exists to make that failure mode
+      # impossible to miss.
+      #
+      # PyTorch's index is used instead of PyPI so we do not drag the ~2.5 GB CUDA
+      # wheel onto a runner with no GPU. That index mirrors torch's own
+      # dependencies (filelock, sympy, networkx, jinja2, fsspec), so replacing the
+      # index here is safe.
+      - name: Install CPU-only PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the package (editable)
+        # Editable is required, not a convenience. core/settings.py derives the
+        # project root from its own __file__ (`parents[3]`), so a regular install
+        # into site-packages would look for configs/ inside site-packages and find
+        # nothing. --no-deps because requirements.txt already resolved them.
+        run: python -m pip install -e . --no-deps --no-build-isolation
+
+      - name: Verify torch is importable
+        # Catch the false-green at its source: if the install silently failed, fail
+        # here instead of letting the suite pass on skips.
+        run: python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Run offline suite
+        # `network` is deselected by default in pyproject's addopts; `gpu` is
+        # deselected here because hosted runners have no CUDA device. Note that the
+        # GPU test would otherwise *skip itself*, which is precisely the silence
+        # this job refuses to accept.
+        #
+        # pipefail matters: without it, `tee` exits 0 and would mask a failing
+        # pytest exit code, turning the whole job into a no-op.
+        run: |
+          set -o pipefail
+          python -m pytest -m "not network and not gpu" -rs --color=no | tee pytest.log
+
+      - name: Fail if any test skipped
+        # A skip here means the suite is not exercising what it claims to. The
+        # offline suite is expected to be 153 passed / 0 skipped.
+        run: |
+          if grep -qE '[0-9]+ skipped' pytest.log; then
+            echo "::error::Tests were skipped, so this run did not validate the code it claims to."
+            grep -E 'SKIPPED|skipped' pytest.log
+            exit 1
+          fi
+          echo "No tests skipped."
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log
+          path: pytest.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Dashboard: type check and production build.
+  # ---------------------------------------------------------------------------
+  web:
+    name: Dashboard build (Node 20)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Next.js 15 requires Node 18.18+; 20 is the current LTS.
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        # `npm ci`, not `install`: it installs exactly the committed lockfile and
+        # fails if web/package.json and the lockfile have drifted apart, which is
+        # the drift most likely to reach a user.
+        run: npm ci
+
+      - name: Type check
+        # Run separately from the build so a type error fails with its own clear
+        # signal rather than being buried in build output.
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Live archive suite. On demand only.
+  # ---------------------------------------------------------------------------
+  live:
+    name: Live archive suite (manual)
+    # Deliberately NOT on the push path. These tests perform real byte-range reads
+    # against the public Sentinel-2 archive and take roughly two minutes, so an
+    # upstream catalogue outage would fail a commit that is perfectly correct.
+    # Trigger from the Actions tab (workflow_dispatch).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install runtime dependencies
+        # No torch needed: the live tests exercise ingest, preprocess, and pipeline
+        # only, which is also why this job stays fast.
+        run: python -m pip install -r requirements.txt
+
+      - name: Install the package (editable)
+        run: python -m pip install -e . --no-deps --no-build-isolation
+
+      - name: Run live archive suite
+        # The CLI `-m network` overrides the `not network` default from pyproject.
+        run: python -m pytest -m network -rs --color=no
