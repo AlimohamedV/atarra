@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atarra"
+version = "0.1.0"
+description = "Automated Tracking, Analysis, and Remediation Recommendation Architecture for aquatic invasive weeds using multispectral satellite telemetry and deep learning"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+
+# NOTE ON NUMPY: the CUDA PyTorch stack (2.6.0+cu124) already on this machine is
+# built against numpy 1.26.4. Upgrading numpy to 2.x shadows that build and breaks
+# `import torch`. The pin below is load-bearing, not cosmetic.
+dependencies = [
+    "numpy>=1.24,<2",
+    "rasterio>=1.4",
+    "pyproj>=3.6",
+    "pyogrio>=0.10",
+    "pystac-client>=0.8",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "pillow>=10.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Deep learning. Torch itself is intentionally NOT declared: it is pre-installed
+# as a CUDA build and re-resolving it from PyPI would pull a CPU wheel over the
+# working GPU one.
+ml = [
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "timm>=1.0",
+    "segmentation-models-pytorch>=0.4",
+]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+atarra = "atarra.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+atarra = ["db/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `-m 'not network'` is not cosmetic. The live tests do real windowed reads of
+# remote satellite imagery and a full mosaic build takes minutes, so running them
+# by default turns `pytest` into a multi-minute network-dependent command. They are
+# opt-in: `pytest -m network`.
+addopts = "-q -m 'not network'"
+markers = [
+    "network: hits live external services; run explicitly with `-m network`",
+    "gpu: requires a CUDA device",
+]

@@ -1,0 +1,45 @@
+# ATARRA runtime dependencies.
+#
+# Install with:
+#   py -3.11 -m venv .venv --system-site-packages
+#   .venv/Scripts/python -m pip install wheel
+#   .venv/Scripts/python -m pip install -r requirements.txt
+#   .venv/Scripts/python -m pip install -e . --no-deps --no-build-isolation
+#
+# --system-site-packages matters on this machine: a CUDA PyTorch build already
+# lives in the base environment, and re-resolving torch here would replace the
+# working GPU wheel with a CPU one and cost ~2.5 GB of downloads.
+
+# --- Numerical / geospatial ---------------------------------------------------
+# numpy is pinned below 2 on purpose. The installed CUDA PyTorch build
+# (2.6.0+cu124) is compiled against numpy 1.26.4; installing numpy 2 shadows it
+# and breaks `import torch` with a binary-incompatibility error.
+numpy>=1.24,<2
+rasterio>=1.4
+pyproj>=3.6
+pyogrio>=0.10
+pandas>=2.0
+scipy>=1.11
+pyyaml>=6.0
+
+# --- Imagery discovery --------------------------------------------------------
+pystac-client>=0.8
+requests>=2.31
+
+# --- Service ------------------------------------------------------------------
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.8
+pydantic-settings>=2.4
+python-dotenv>=1.0
+pillow>=10.0
+
+# --- Development --------------------------------------------------------------
+pytest>=8.0
+httpx>=0.27
+
+# --- Deep learning (optional; torch is expected to be pre-installed) ----------
+# torch>=2.4
+# torchvision>=0.19
+# timm>=1.0
+# segmentation-models-pytorch>=0.4

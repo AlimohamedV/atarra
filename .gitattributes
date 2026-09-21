@@ -1,0 +1,39 @@
+# Normalise line endings.
+#
+# This machine has core.autocrlf=true, which would leave CRLF in the working tree
+# while the repository holds LF -- so the same commit can look entirely modified
+# depending on which machine checks it out. Pinning the working tree to LF makes
+# the project behave identically on this Windows dev box, on Linux, and on
+# whichever machine runs the demo. `text=auto` still detects and stores text as
+# LF, and leaves anything genuinely binary alone.
+* text=auto eol=lf
+
+# Explicitly binary: never diff, merge, or convert these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tif binary
+*.tiff binary
+*.npy binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.safetensors binary
+*.onnx binary
+*.h5 binary
+*.pkl binary
+
+# Windows scripts must keep CRLF to stay runnable.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Shell scripts must keep LF to stay runnable.
+*.sh text eol=lf

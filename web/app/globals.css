@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+/* MapLibre's canvas must fill its container; without an explicit height the map
+   collapses to zero pixels and shows nothing. */
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+.maplibregl-map {
+  font-family: inherit;
+}
+
+/* Attribute MapLibre's own controls to the dark theme. */
+.maplibregl-ctrl-attrib,
+.maplibregl-ctrl-scale {
+  background: rgba(15, 23, 42, 0.85) !important;
+  color: #cbd5e1 !important;
+  border-color: #334155 !important;
+}
+
+.maplibregl-ctrl-attrib a {
+  color: #7dd3fc !important;
+}

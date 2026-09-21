@@ -1,0 +1,84 @@
+# Sentinel-2 L2A band contract.
+#
+# `asset` is the STAC asset name used by the Earth Search / AWS `sentinel-2-l2a`
+# collection (verified live). `gsd` is the native ground sample distance, which
+# varies within a single scene: B02/B03/B04/B08 are 10 m, the red-edge and SWIR
+# bands are 20 m. Everything is resampled onto one common 10 m grid before it is
+# stacked, because a tensor whose channels sit on different pixel grids is a
+# silent correctness bug, not a design choice.
+
+bands:
+  B02: { asset: blue,      gsd: 10, resample: bilinear }
+  B03: { asset: green,     gsd: 10, resample: bilinear }
+  B04: { asset: red,       gsd: 10, resample: bilinear }
+  B05: { asset: rededge1,  gsd: 20, resample: bilinear }
+  B06: { asset: rededge2,  gsd: 20, resample: bilinear }
+  B07: { asset: rededge3,  gsd: 20, resample: bilinear }
+  B08: { asset: nir,       gsd: 10, resample: bilinear }
+  B8A: { asset: nir08,     gsd: 20, resample: bilinear }
+  B11: { asset: swir16,    gsd: 20, resample: bilinear }
+  B12: { asset: swir22,    gsd: 20, resample: bilinear }
+
+# Scene Classification Layer drives cloud/shadow masking. It is a *categorical*
+# band, so it must be resampled nearest-neighbour. Interpolating class codes
+# invents class values that do not exist and corrupts the mask.
+mask_band:
+  name: SCL
+  asset: scl
+  gsd: 20
+  resample: nearest
+
+# --- Band sets used by the pipeline -----------------------------------------
+# The 8-band multispectral stack the spec calls for: visible + red-edge + NIR +
+# SWIR. This is the input that should beat RGB.
+bands_8: [B02, B03, B04, B05, B08, B8A, B11, B12]
+
+# Full 10-band stack, adding the two remaining red-edge bands.
+bands_10: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
+
+# The deliberately weaker baseline. Training this on identical splits/seed is how
+# the "multispectral gain" claim gets substantiated instead of asserted.
+bands_rgb: [B04, B03, B02]
+
+# --- Reflectance handling ----------------------------------------------------
+#
+# IMPORTANT, and not what the item metadata claims. Read this before changing it.
+#
+# Sentinel-2 L2A can be stored two ways:
+#   dn_scale        reflectance = DN  * 0.0001
+#   offset_applied  reflectance = (DN - 1000) * 0.0001
+#
+# The archive's *item-level* metadata declares `offset: -0.1`, i.e. it asks for the
+# second form. Its own *collection-level* metadata declares `offset: 0`. The two
+# contradict, so the pixels were measured directly:
+#
+#   * Deep clear Red Sea water, where NIR reflectance is physically ~0.00:
+#       dn_scale       -> +0.032  (plausible)
+#       offset_applied -> -0.068  (physically implausible)
+#   * Lake Burullus, all 8 bands:
+#       dn_scale       -> 0.0 % of pixels negative
+#       offset_applied -> 74 % of pixels negative
+#   * A deep-ocean window shows essentially no values clipped at zero, which is
+#     what would happen had the archive subtracted 1000 from the stored integers.
+#
+# Reflectance cannot be three-quarters negative. So `dn_scale` is the validated
+# convention and is the default. `validate_reflectance()` re-checks this on any
+# new scene and warns if the assumption stops holding, so a change of archive or
+# processing baseline announces itself instead of silently biasing every index.
+reflectance:
+  mode: dn_scale
+  scale: 0.0001
+  # The offset the archive's item metadata advertises. Recorded for traceability;
+  # only applied when mode is `offset_applied`.
+  declared_offset: -0.1
+  # Warn if more than this fraction of valid pixels convert to negative
+  # reflectance, since that indicates the convention has drifted.
+  max_negative_fraction: 0.02
+
+nodata: 0
+
+# --- SCL class codes that are unusable for vegetation analysis ---------------
+scl_invalid_classes: [0, 1, 3, 8, 9, 10, 11]
+# 0 nodata, 1 saturated, 3 cloud shadow, 8/9 cloud, 10 cirrus, 11 snow
+scl_water_classes: [6]
+scl_vegetation_classes: [4]

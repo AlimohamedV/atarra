@@ -1,0 +1,32 @@
+# ATARRA study zones.
+#
+# These are the monitored AOIs the pipeline polls. Bounding boxes are in WGS84
+# lon/lat as [west, south, east, north] so they can be handed straight to a STAC
+# search; each zone also declares the projected CRS used for raster work.
+#
+# `role` documents the hydrological character of the zone, which the decision
+# engine uses later: wetlands are managed for habitat and open-water exchange,
+# while canal corridors are managed for cross-section capacity.
+
+study_areas:
+  burullus:
+    name: "Lake Burullus (Ramsar wetland)"
+    role: wetland
+    # Northern Delta coastal lagoon. Verified live: 29 cloud-free Aug-2023
+    # scenes under 10% cloud, spanning MGRS tiles 36RUV/36STA/36RTV.
+    bbox: [30.55, 31.38, 31.15, 31.70]
+    crs: EPSG:32636
+
+  manzala:
+    name: "Lake Manzala (Damietta boundary)"
+    role: wetland
+    bbox: [31.80, 31.05, 32.15, 31.35]
+    crs: EPSG:32636
+
+  kafr_elsheikh_canal:
+    name: "Kafr El-Sheikh agricultural canal corridor"
+    role: canal
+    # Dense irrigation network inside the Delta; narrower than the lagoons and
+    # where cross-section blockage actually costs the MWRI water.
+    bbox: [30.70, 31.02, 31.00, 31.28]
+    crs: EPSG:32636
