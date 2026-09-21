@@ -112,6 +112,33 @@ atarra cache                          # report cache size against its ceiling
 
 Network tests are marked and deselected by default so the suite never fails merely because a satellite catalogue is unreachable.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request.
+
+| Job | Runner | Trigger | Covers |
+|---|---|---|---|
+| `test` | ubuntu-latest | every push | offline suite; **0 skips tolerated** |
+| `web` | ubuntu-latest | every push | `tsc --noEmit` + production build |
+| `live` | ubuntu-latest | manual dispatch | live archive suite, ~2 min |
+| `gpu` | self-hosted | manual dispatch + `run_gpu` | GPU tests on real CUDA hardware |
+
+Network tests deliberately stay off the push path: they make real ranged reads against the public archive, so an upstream catalogue outage would fail a commit that is perfectly correct. Dispatch the workflow from the Actions tab when you want them.
+
+CI installs **CPU-only** PyTorch. Without torch every model test would hit `pytest.importorskip` and *skip*, so the job would report success having validated none of the machine learning. A dedicated step fails the run if anything skips, so that false-green cannot pass unnoticed.
+
+#### Enabling the GPU job
+
+Hosted runners have no CUDA device, so the GPU-marked tests would otherwise only ever run on one developer's machine. Give them a home by registering a self-hosted runner that carries the `gpu` label:
+
+```bash
+./config.sh --url https://github.com/<owner>/<repo> --token <token> --labels gpu
+```
+
+Then dispatch the workflow with `run_gpu` ticked. If no runner carries that label the job **queues and waits** rather than failing — cancel it and check the label. The job installs the CUDA PyTorch wheel (~2.5 GB) once; a self-hosted runner keeps its pip cache, so later runs reinstall from cache instead of re-downloading.
+
+Before running anything the job asserts that `torch.cuda.is_available()` is true. Because every GPU test skips itself when no device is present, a mislabelled CPU runner would otherwise pass while testing nothing.
+
 ---
 
 ## Design rules that are load-bearing
