@@ -246,6 +246,70 @@ class TestWeakLabels:
         if halophyte.any():
             assert result["review"][halophyte].all()
 
+    def test_every_class_survives_confidence_filtering(self, simple_grid):
+        """No class may be annihilated by the ambiguity filter.
+
+        Regression test for a real trap. REVIEW_THRESHOLD (0.60) is tuned for
+        review-queue size, and the per-class scores saturate at different ceilings
+        by design: the crop rule tops out at 0.597 and the halophyte rule at
+        0.501. Reusing that threshold as a *loss* filter therefore dropped the
+        entire cropland class by 0.003 of confidence -- silently turning a
+        4-class problem into a 2-class one with no error anywhere. The filter is
+        margin-based instead, so all four classes must stay trainable.
+        """
+        representatives = {
+            PHRAGMITES: {"ndvi": 0.78, "ndre": 0.50, "ndmi": 0.30, "ndwi": -0.12},
+            1: {"ndvi": 0.62, "ndre": 0.25, "ndmi": 0.08, "ndwi": -0.30},
+            2: {"ndvi": 0.30, "ndre": 0.10, "ndmi": 0.05, "ndwi": 0.05},
+            0: {"ndvi": 0.05, "ndre": 0.02, "ndmi": -0.10, "ndwi": 0.60},
+        }
+        for expected, values in representatives.items():
+            result = weak_label(self._uniform_indices(simple_grid, **values))
+            assert (result["labels"] == expected).mean() > 0.9, (
+                f"expected class {expected} for {values}"
+            )
+            assert result["trainable"].mean() > 0.9, (
+                f"class {expected} was filtered out of the training set; "
+                "the ambiguity test must not be the review test"
+            )
+
+    def test_ambiguous_pixels_are_dropped_from_the_loss(self, simple_grid):
+        """A reed/crop coin flip is uninformative, so it must not shape the loss."""
+        indices = self._uniform_indices(
+            simple_grid, ndvi=0.78, ndre=0.50, ndmi=0.30, ndwi=-0.35
+        )
+        result = weak_label(indices)
+        assert (result["labels"] == PHRAGMITES).mean() > 0.9, "the rules still point at reed"
+        assert result["ambiguous"].mean() > 0.9
+        assert result["trainable"].mean() < 0.1, "but the loss must not learn from it"
+        assert result["review"].mean() > 0.9, "it belongs in the annotation queue"
+
+    def test_trainable_never_exceeds_usable(self, veg_water_stack):
+        indices = compute_indices(veg_water_stack)
+        result = weak_label(indices, valid=veg_water_stack.valid)
+        assert not (result["trainable"] & ~result["usable"]).any()
+        assert not (result["trainable"] & ~veg_water_stack.valid).any(), (
+            "nodata must never be trainable"
+        )
+
+    def test_drop_ambiguous_can_be_disabled(self, simple_grid):
+        from atarra.datasets.weak_labels import WeakLabelConfig
+
+        indices = self._uniform_indices(
+            simple_grid, ndvi=0.78, ndre=0.50, ndmi=0.30, ndwi=-0.35
+        )
+        result = weak_label(indices, config=WeakLabelConfig(drop_ambiguous=False))
+        assert result["ambiguous"].mean() > 0.9, "the flag does not change the diagnosis"
+        assert (result["trainable"] == result["usable"]).all()
+
+    def test_statistics_account_for_dropped_pixels(self, simple_grid):
+        indices = self._uniform_indices(
+            simple_grid, ndvi=0.78, ndre=0.50, ndmi=0.30, ndwi=-0.35
+        )
+        stats = label_statistics(weak_label(indices))
+        assert stats["trainable_px"] + stats["dropped_px"] == stats["usable_px"]
+        assert stats["dropped_px"] > 0
+
     def test_invalid_mask_forces_ignore(self, simple_grid):
         height, width = simple_grid.height, simple_grid.width
         indices = {

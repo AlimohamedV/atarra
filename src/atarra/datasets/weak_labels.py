@@ -40,7 +40,14 @@ CROPS_SOIL = 1
 MIXED_HALOPHYTES = 2
 PHRAGMITES = 3
 
+# The class order is fixed pipeline-wide: the labeller, the loss, and every metric
+# index into it. This is the only definition -- metrics and the model import these
+# rather than repeating the list, because three copies that agree today are three
+# copies that can disagree tomorrow, and the failure mode is silently scoring one
+# class with another's numbers.
 CLASS_NAMES = ["open_water", "crops_soil", "mixed_halophytes", "phragmites_australis"]
+NUM_CLASSES = len(CLASS_NAMES)
+PHRAGMITES_CODE = PHRAGMITES
 
 # Below this per-pixel confidence a label is unreliable and belongs in the human
 # review queue. Chosen so that the review set stays a manageable fraction of the
@@ -63,6 +70,19 @@ class WeakLabelConfig:
     reed_max_ndwi: float = 0.25
     halophyte_ndvi: float = 0.20
     min_agreement: int = 2
+    # Drop genuinely ambiguous pixels from the loss mask (standard confidence
+    # filtering for weak supervision). Set False to train on every usable pixel.
+    drop_ambiguous: bool = True
+    # The ambiguity test is deliberately NOT the review test. REVIEW_THRESHOLD is
+    # tuned so the human review queue stays a manageable size, and the per-class
+    # scores have different ceilings by design -- the crop and halophyte rules
+    # saturate low. Using it as a training filter drops the entire cropland class
+    # at 0.597 against a 0.60 cut and every halophyte at 0.501, leaving a 2-class
+    # problem wearing a 4-class label. Margin is what actually separates a coin
+    # flip from a decision: a clear reed pixel scores 0.23 margin, the reed/crop
+    # confusion 0.067, cropland 0.52. So margin and agreement do the filtering.
+    train_margin: float = 0.08
+    train_max_agreement: int = 2
     notes: list[str] = field(default_factory=list)
 
 
@@ -178,23 +198,45 @@ def weak_label(
     agree = (stack >= (sorted_scores[-1][None, :] - 0.10)).sum(axis=0)
 
     confident = (confidence >= REVIEW_THRESHOLD) & (margin >= 0.08) & (agree <= 2)
-    review = ~confident
+
+    # Which pixels carry information about their own label, as opposed to being
+    # coin flips between two classes. See the note on `train_margin`.
+    ambiguous = (margin < cfg.train_margin) | (agree > cfg.train_max_agreement)
 
     # The mixed-halophyte class is the residual bucket: "something is growing here
     # and it is not plainly water, crop or reed". By construction we cannot be
-    # confident about it from spectra alone, so it always goes to human review
-    # rather than being trained on as if it were a real label. The honest
-    # consequence is that weak supervision supplies no halophyte examples at all --
-    # that class needs actual annotation, and pretending otherwise would teach the
-    # model to be confidently wrong about the hardest class in the problem.
-    review |= (labels == MIXED_HALOPHYTES)
+    # confident about it from spectra alone, so it always goes to human review --
+    # that class needs actual annotation.
+    halophyte = labels == MIXED_HALOPHYTES
 
     finite = np.isfinite(stack).all(axis=0)
     if valid is not None:
         usable = valid & finite
     else:
         usable = finite
-    review |= ~usable
+
+    # `review` is the annotation worklist: every pixel a human should adjudicate.
+    review = ~confident | halophyte | ~usable
+
+    # `trainable` is the loss mask, and it is deliberately NOT the same mask.
+    #
+    # Halophyte pixels stay trainable even though the class is flagged for review.
+    # This docstring used to read as though the class should simply be withheld,
+    # but that does not survive contact with the loss: a class with zero examples
+    # is not conservative, it is unlearnable. Its IoU would be undefined and the
+    # 4-class mIoU would quietly be arithmetic over three classes. So the class is
+    # trained on, its weakness is reported per class instead of hidden, and it is
+    # the top annotation priority.
+    #
+    # Ambiguity is the genuinely different case: a pixel that is a coin flip
+    # between reed and crop teaches the model to confuse exactly the pair this
+    # project exists to separate. Those are dropped from the loss and become the
+    # annotation queue instead.
+    if cfg.drop_ambiguous:
+        trainable = usable & ~ambiguous
+    else:
+        trainable = usable
+
     labels = np.where(usable, labels, -1).astype(np.int8)
 
     return {
@@ -202,6 +244,8 @@ def weak_label(
         "confidence": confidence,
         "review": review,
         "usable": usable,
+        "trainable": trainable,
+        "ambiguous": ambiguous,
         "scores": scores,
         "margin": margin,
     }
@@ -228,8 +272,12 @@ def label_statistics(result: dict, *, class_names: list[str] | None = None) -> d
         )
 
     review_px = int(result["review"].sum())
+    trainable_px = int(result["trainable"].sum())
     return {
         "usable_px": total,
+        "trainable_px": trainable_px,
+        "dropped_px": total - trainable_px,
+        "dropped_fraction": round((total - trainable_px) / max(1, total), 5),
         "review_px": review_px,
         "review_fraction": round(review_px / max(1, labels.size), 5),
         "mean_confidence": round(float(result["confidence"][usable].mean()), 4),

@@ -20,6 +20,7 @@ from atarra.core.config import get_bands, get_study_areas
 from atarra.core.errors import AtarraError
 from atarra.core.logging import get_logger
 from atarra.core.settings import get_settings
+from atarra.datasets.weak_labels import CLASS_NAMES
 from atarra.pipeline import DEFAULT_PREVIEW_GSD, available_dates, get_cache, load_composite
 from atarra.preprocess.indices import INDEX_BANDS
 from atarra.viz.render import apply_colormap, legend, render_true_color, save_png
@@ -179,6 +180,100 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _evenly_spaced(items: list, count: int) -> list:
+    """Pick ``count`` entries spread across ``items``.
+
+    Spread rather than "the N most recent" on purpose: a model trained only on
+    late-summer imagery has seen the single season in which reed is easiest to
+    separate from cropland, and would be weakest exactly where it will be deployed.
+    """
+    if count >= len(items):
+        return list(items)
+    if count == 1:
+        return [items[len(items) // 2]]
+    step = (len(items) - 1) / (count - 1)
+    return [items[round(i * step)] for i in range(count)]
+
+
+def cmd_dataset_build(args: argparse.Namespace) -> int:
+    """Fetch imagery, tile it, and write a store that training can reuse."""
+    from atarra.datasets.store import build_store
+
+    end = args.end or Date.today()
+    start = args.start or (end - timedelta(days=30 * max(1, args.months)))
+    found = available_dates(args.area, start, end, max_cloud_cover=args.max_cloud)
+    if not found:
+        print(f"error: no usable imagery for {args.area} between {start} and {end}", file=sys.stderr)
+        return 1
+
+    available = [Date.fromisoformat(item["date"]) for item in found]
+    selected = _evenly_spaced(available, args.dates)
+
+    print(f"{args.area}: {len(available)} date(s) available, building {len(selected)} shard(s)")
+    print(f"  range   {start} -> {end}")
+    print(f"  gsd     {args.gsd:g} m   tile {args.tile_size}px   stride {args.stride or args.tile_size}")
+    print(f"  out     {args.out}")
+    print(f"  dates   {', '.join(d.isoformat() for d in selected)}")
+    print("\nThis performs real ranged reads of the archive and takes minutes.\n")
+
+    manifest = build_store(
+        Path(args.out),
+        args.area,
+        selected,
+        gsd=args.gsd,
+        tile_size=args.tile_size,
+        stride=args.stride,
+        max_size=args.max_size,
+        window_days=args.window_days,
+        drop_empty=args.drop_empty,
+        max_cloud_cover=args.max_cloud,
+        first=args.rebuild,
+    )
+
+    totals = manifest["totals"]
+    print(f"\nwrote {totals['tiles']} tiles across {totals['shards']} shard(s) to {args.out}")
+    print(f"  trainable pixels  {totals['trainable_px']:,}")
+    print("  class balance (pixels):")
+    for code, name in enumerate(CLASS_NAMES):
+        count = totals["class_counts"][code]
+        share = count / max(1, totals["trainable_px"]) * 100
+        print(f"    {name:<24} {count:>12,}  {share:5.1f}%")
+        if count == 0:
+            print(f"      WARNING: no {name} pixels; that class cannot be learned")
+    for entry in manifest["skipped"]:
+        print(f"  skipped {entry['date']}: {entry['reason']}")
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """Train a segmentation model from a tile store."""
+    from atarra.train.run import format_report, train_from_store
+
+    bands = get_bands()
+    selected = {
+        "8": bands.bands_8,
+        "10": bands.bands_10,
+        "rgb": bands.bands_rgb,
+    }[args.bands]
+
+    metrics = train_from_store(
+        args.store,
+        bands=selected,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        out_dir=args.out,
+        run_name=args.name,
+        seed=args.seed,
+        num_workers=args.workers,
+        device=args.device,
+        patience=args.patience,
+        max_tiles=args.max_tiles,
+    )
+    print("\n" + format_report(metrics))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="atarra",
@@ -209,6 +304,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-size", type=int, default=1024)
     p.add_argument("--out", default=None, help="output directory")
     p.set_defaults(func=cmd_preview)
+
+    p = sub.add_parser("dataset", help="build a reusable tile store for training")
+    dataset_sub = p.add_subparsers(dest="dataset_command", required=True)
+    q = dataset_sub.add_parser("build", help="fetch imagery, tile it, and write a store")
+    q.add_argument("area")
+    q.add_argument("--out", default="data/dataset", help="store directory")
+    q.add_argument("--dates", type=int, default=12, help="how many shards to build (default 12)")
+    q.add_argument("--months", type=int, default=24, help="how far back to search (default 24)")
+    q.add_argument("--start", type=_parse_date, default=None)
+    q.add_argument("--end", type=_parse_date, default=None)
+    q.add_argument("--max-cloud", type=float, default=None)
+    q.add_argument(
+        "--gsd",
+        type=float,
+        default=20.0,
+        help="resolution in metres; 20 keeps ~12 dates inside Colab's free RAM budget",
+    )
+    q.add_argument("--tile-size", type=int, default=256)
+    q.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="defaults to --tile-size; a smaller value overlaps tiles for more samples",
+    )
+    q.add_argument("--max-size", type=int, default=8192, help="largest AOI dimension in px")
+    q.add_argument("--window-days", type=int, default=3)
+    q.add_argument("--drop-empty", action="store_true", help="skip tiles without reed")
+    q.add_argument("--rebuild", action="store_true", help="replace an existing store")
+    q.set_defaults(func=cmd_dataset_build)
+
+    p = sub.add_parser("train", help="train a segmentation model from a tile store")
+    p.add_argument("store", help="store directory built by `atarra dataset build`")
+    p.add_argument(
+        "--bands",
+        choices=["8", "10", "rgb"],
+        default="8",
+        help="8 = multispectral (default), 10 = all, rgb = the 3-band control arm",
+    )
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--out", default="data/checkpoints", help="run output directory")
+    p.add_argument("--name", default=None, help="run name (default: derived from area and bands)")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--device", default=None, help="cpu, cuda, or unset for automatic")
+    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--max-tiles", type=int, default=None, help="truncate for a smoke run")
+    p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("cache", help="report or clear the composite cache")
     p.add_argument("--clear", action="store_true")

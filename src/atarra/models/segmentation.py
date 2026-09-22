@@ -31,9 +31,8 @@ import torch.nn.functional as F
 
 from atarra.core.errors import AtarraError
 
-CLASS_NAMES = ["open_water", "crops_soil", "mixed_halophytes", "phragmites_australis"]
-NUM_CLASSES = len(CLASS_NAMES)
-PHRAGMITES_CODE = 3
+# Single definition lives with the labeller that produces these codes.
+from atarra.datasets.weak_labels import CLASS_NAMES, NUM_CLASSES, PHRAGMITES_CODE
 
 
 class DoubleConv(nn.Module):

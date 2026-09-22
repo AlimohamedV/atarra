@@ -14,11 +14,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# Class order is fixed pipeline-wide. Reed is last because it is the class the
-# project exists to find, and the one whose per-class score gets quoted.
-CLASS_NAMES = ["open_water", "crops_soil", "mixed_halophytes", "phragmites_australis"]
-NUM_CLASSES = len(CLASS_NAMES)
-PHRAGMITES_CODE = 3
+# Class order is fixed pipeline-wide; imported so there is a single definition.
+# Reed is last because it is the class the project exists to find, and the one whose
+# per-class score gets quoted.
+from atarra.datasets.weak_labels import (
+    CLASS_NAMES,
+    NUM_CLASSES,
+    PHRAGMITES_CODE,
+)
 
 
 def confusion_matrix(

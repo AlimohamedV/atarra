@@ -52,6 +52,73 @@ def _tile_grid(width: int, height: int, size: int, stride: int | None) -> Iterat
             yield row, col
 
 
+def augment_tile(
+    image: np.ndarray, mask: np.ndarray, *, seed: int, index: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Random flips, right-angle rotations, and mild spectral jitter.
+
+    Seeded per index so a given tile augments identically across epochs. Fully
+    random augmentation would make the validation split non-reproducible, which
+    quietly destroys the ability to compare two runs.
+
+    Module-level rather than a method because the on-disk tile store needs exactly
+    this transformation, and two implementations of "the same" augmentation drift.
+    """
+    rng = np.random.default_rng(seed + index)
+
+    if rng.random() < 0.5:
+        image, mask = image[:, :, ::-1], mask[:, ::-1]
+    if rng.random() < 0.5:
+        image, mask = image[:, ::-1, :], mask[::-1, :]
+    rotations = int(rng.integers(0, 4))
+    if rotations:
+        image = np.rot90(image, rotations, axes=(1, 2))
+        mask = np.rot90(mask, rotations, axes=(0, 1))
+
+    # Spectral jitter: a multiplicative per-band gain, simulating the
+    # radiometric variation between overpasses and seasons. Applied to
+    # reflectance only; the mask is untouched.
+    if rng.random() < 0.5:
+        gains = rng.normal(1.0, 0.05, size=(image.shape[0], 1, 1)).astype(np.float32)
+        image = image * gains
+
+    return np.ascontiguousarray(image), np.ascontiguousarray(mask)
+
+
+def summarise_counts(counts: np.ndarray) -> dict:
+    """Turn a per-class pixel tally into the reported class-balance summary."""
+    total = int(counts.sum())
+    return {
+        "counts": [int(c) for c in counts],
+        "fractions": (counts / total).round(6).tolist() if total else [0.0] * len(counts),
+        "total_px": total,
+    }
+
+
+def class_weights_from_counts(counts: np.ndarray, *, scheme: str) -> np.ndarray:
+    """Per-class loss weights.
+
+    Inverse frequency by default. Reed beds are a small minority of any delta
+    scene, so unweighted cross-entropy is minimised by predicting "not reed"
+    everywhere -- which scores well on pixel accuracy and is useless.
+    """
+    counts = np.asarray(counts, dtype=np.float64).copy()
+    counts[counts == 0] = 1.0
+    if scheme == "inverse_frequency":
+        weights = counts.sum() / (counts * len(counts))
+    elif scheme == "sqrt_inverse":
+        weights = np.sqrt(counts.sum() / (counts * len(counts)))
+    elif scheme == "uniform":
+        weights = np.ones_like(counts)
+    else:
+        raise AtarraError(
+            f"unknown class weighting scheme {scheme!r}; "
+            "expected 'inverse_frequency', 'sqrt_inverse' or 'uniform'"
+        )
+    weights = np.clip(weights, 0.05, 50.0)
+    return (weights / weights.mean()).astype(np.float32)
+
+
 class CompositeTileDataset:
     """Tiles cut from index composites, labelled by the weak-supervision rules.
 
@@ -134,9 +201,12 @@ class CompositeTileDataset:
 
         mask = labelled["labels"][rows, cols].astype(np.int64)
         confidence = labelled["confidence"][rows, cols].astype(np.float32)
-        valid = labelled["usable"][rows, cols]
+        # `trainable`, not `usable`. The two differ where the rule engine was not
+        # confident: those pixels are valid but uninformative, so they must not
+        # shape the loss. See weak_labels.weak_label.
+        valid = labelled["trainable"][rows, cols]
 
-        # Invalid pixels must not contribute to the loss. -1 is the ignore index
+        # Excluded pixels must not contribute to the loss. -1 is the ignore index
         # the metrics and loss both understand.
         mask = np.where(valid, mask, IGNORE_INDEX)
 
@@ -149,73 +219,28 @@ class CompositeTileDataset:
             "image": image,
             "mask": mask,
             "confidence": confidence,
+            # Carried through so the annotation queue can be exported without
+            # re-running the rule engine over every composite.
+            "review": labelled["review"][rows, cols],
             "key": record.key,
             "block": record.block,
         }
 
     def _augment(self, image: np.ndarray, mask: np.ndarray, index: int) -> tuple[np.ndarray, np.ndarray]:
-        """Random flips, right-angle rotations, and mild spectral jitter.
-
-        Seeded per index so a given tile augments identically across epochs. Fully
-        random augmentation would make the validation split non-reproducible, which
-        quietly destroys the ability to compare two runs.
-        """
-        rng = np.random.default_rng(self.seed + index)
-
-        if rng.random() < 0.5:
-            image, mask = image[:, :, ::-1], mask[:, ::-1]
-        if rng.random() < 0.5:
-            image, mask = image[:, ::-1, :], mask[::-1, :]
-        rotations = int(rng.integers(0, 4))
-        if rotations:
-            image = np.rot90(image, rotations, axes=(1, 2))
-            mask = np.rot90(mask, rotations, axes=(0, 1))
-
-        # Spectral jitter: a multiplicative per-band gain, simulating the
-        # radiometric variation between overpasses and seasons. Applied to
-        # reflectance only; the mask is untouched.
-        if rng.random() < 0.5:
-            gains = rng.normal(1.0, 0.05, size=(image.shape[0], 1, 1)).astype(np.float32)
-            image = image * gains
-
-        return np.ascontiguousarray(image), np.ascontiguousarray(mask)
+        return augment_tile(image, mask, seed=self.seed, index=index)
 
     def index_statistics(self) -> dict:
         """Class balance across every tile, to set loss weights sensibly."""
         counts = np.zeros(4, dtype=np.int64)
         for labelled in self._labelled:
-            labels, usable = labelled["labels"], labelled["usable"]
+            labels, usable = labelled["labels"], labelled["trainable"]
             for code in range(4):
                 counts[code] += int(((labels == code) & usable).sum())
-        total = int(counts.sum())
-        return {
-            "counts": counts.tolist(),
-            "fractions": (counts / total).round(6).tolist() if total else [0.0] * 4,
-            "total_px": total,
-        }
+        return summarise_counts(counts)
 
     def class_weights(self, *, scheme: str = "inverse_frequency") -> np.ndarray:
-        """Per-class loss weights.
-
-        Inverse frequency by default. Reed beds are a small minority of any delta
-        scene, so unweighted cross-entropy is minimised by predicting "not reed"
-        everywhere -- which scores well on pixel accuracy and is useless.
-        """
         counts = np.array(self.index_statistics()["counts"], dtype=np.float64)
-        counts[counts == 0] = 1.0
-        if scheme == "inverse_frequency":
-            weights = counts.sum() / (counts * len(counts))
-        elif scheme == "sqrt_inverse":
-            weights = np.sqrt(counts.sum() / (counts * len(counts)))
-        elif scheme == "uniform":
-            weights = np.ones_like(counts)
-        else:
-            raise AtarraError(
-                f"unknown class weighting scheme {scheme!r}; "
-                "expected 'inverse_frequency', 'sqrt_inverse' or 'uniform'"
-            )
-        weights = np.clip(weights, 0.05, 50.0)
-        return (weights / weights.mean()).astype(np.float32)
+        return class_weights_from_counts(counts, scheme=scheme)
 
     def as_torch_dataset(self):
         """Wrap as a ``torch.utils.data.Dataset`` yielding tensors."""

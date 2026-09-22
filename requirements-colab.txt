@@ -1,0 +1,52 @@
+# ATARRA dependencies for Google Colab.
+#
+# Usage:
+#   !pip install -q -r requirements-colab.txt
+#   !pip install -q -e . --no-deps --no-build-isolation
+#
+# Why this file exists instead of reusing requirements.txt:
+#
+#  1. numpy. requirements.txt caps numpy at <2 because the CUDA torch build on the
+#     development laptop (2.6.0+cu124) is compiled against numpy 1.26.4. Colab
+#     ships numpy 2.0.2 and a torch that is numpy-2 native, so that cap would
+#     downgrade numpy and pull Colab's preinstalled pandas/scipy away from the
+#     versions the runtime is pinned to. numpy is left alone here.
+#
+#  2. torch. Colab already provides a CUDA-enabled PyTorch, which is the entire
+#     reason to train there. Installing torch from PyPI would replace it with
+#     whichever wheel matches, and the GPU is what we came for. So torch is
+#     deliberately absent -- the two install commands above use --no-deps to stop
+#     setuptools from re-resolving it.
+#
+#  3. Python version. Colab runs 3.12.13. pyproject.toml declares `>=3.11` with no
+#     upper bound so that `pip install -e .` is accepted there.
+#
+# Verified against the Colab runtime as documented at
+# https://research.google.com/colaboratory/runtime-version-faq.html
+# (Python 3.12.13, numpy 2.0.2, PyTorch 2.11.0).
+
+# --- Numerical / geospatial ---------------------------------------------------
+rasterio>=1.4
+pyproj>=3.6
+pyogrio>=0.10
+pandas>=2.0
+scipy>=1.11
+pyyaml>=6.0
+
+# --- Imagery discovery --------------------------------------------------------
+# The training set is built from the credential-free Earth Search STAC endpoint,
+# so no secrets are needed in a Colab session.
+pystac-client>=0.8
+requests>=2.31
+
+# --- Service (only needed to run the API/dashboard, not to train) -------------
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.8
+pydantic-settings>=2.4
+python-dotenv>=1.0
+pillow>=10.0
+
+# --- Development --------------------------------------------------------------
+pytest>=8.0
+httpx>=0.27

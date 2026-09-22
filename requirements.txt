@@ -11,9 +11,14 @@
 # working GPU wheel with a CPU one and cost ~2.5 GB of downloads.
 
 # --- Numerical / geospatial ---------------------------------------------------
+# THIS FILE IS THE LOCAL (Windows + CUDA) INSTALL PATH. On Google Colab use
+# requirements-colab.txt instead -- the numpy pin below is wrong there. See the
+# training notebook for the Colab install sequence.
+#
 # numpy is pinned below 2 on purpose. The installed CUDA PyTorch build
 # (2.6.0+cu124) is compiled against numpy 1.26.4; installing numpy 2 shadows it
-# and breaks `import torch` with a binary-incompatibility error.
+# and breaks `import torch` with a binary-incompatibility error. Colab's torch is
+# numpy-2 native, so this is a property of this machine, not of the project.
 numpy>=1.24,<2
 rasterio>=1.4
 pyproj>=3.6

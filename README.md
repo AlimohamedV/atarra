@@ -16,12 +16,14 @@ A GeoAI platform that finds, tracks, and prioritises *Phragmites australis* (com
 | `viz/` — server-side rendering | complete |
 | `api/` — FastAPI service | complete |
 | `db/` — PostGIS-shaped persistence | complete |
-| `datasets/` — weak-supervision labelling | scaffolded |
-| `models/`, `train/` — segmentation | scaffolded |
+| `datasets/` — weak-supervision labelling, tile store, annotation queue | complete |
+| `models/`, `train/` — segmentation, training loop, metrics | complete, models untrained |
 | `forecast/`, `decision/` — growth + threat scoring | scaffolded |
 | `web/` — Next.js + MapLibre dashboard | complete |
 
-"Scaffolded" means the interfaces, contracts, and algorithms are real and unit-tested, but the models are untrained — that requires the labelled dataset and a training run, which is the next milestone.
+"Complete" means implemented and exercised end to end; "scaffolded" means the interfaces, contracts, and algorithms are real and unit-tested but nothing reachable calls them yet.
+
+**No model has been trained.** `data/checkpoints/` is empty, which is why none of the proposal's accuracy targets (§6) has a number behind it yet. The dataset and training path now exist to produce one — see *Training* below.
 
 ---
 
@@ -101,7 +103,40 @@ atarra scenes burullus --months 3     # search the archive and show scene availa
 atarra indices burullus --date 2023-08-19   # compute + report index statistics
 atarra preview burullus --date 2023-08-19 --index ndvi   # write a PNG
 atarra cache                          # report cache size against its ceiling
+
+# training path
+atarra dataset build burullus --gsd 20 --stride 128 --dates 12 --out data/dataset
+atarra train data/dataset --bands 8 --epochs 40
 ```
+
+### Training (on Google Colab)
+
+Training needs a GPU and several gigabytes of imagery, so it belongs on Colab rather than here: this machine has a **4.29 GB** RTX 2050 and had under 3 GB of free disk, while a full Burullus 8-band composite at 10 m is 644 MB *per date*. Colab's runtime is Python **3.12** with numpy **2.0.2** and PyTorch **2.11**; both packaging constraints that would have blocked it (`requires-python < 3.12`, `numpy < 2`) are now scoped to where they actually apply.
+
+`notebooks/atarra_colab_train.ipynb` drives it in **two stages**, and the split is deliberate — free-tier sessions disconnect when idle, so a fetch combined with a training run means one disconnect discards both.
+
+| Stage | What runs | How often |
+|---|---|---|
+| Build | `atarra dataset build burullus --gsd 20 --stride 128 --dates 12 --out <drive>/store_20m` | once, 30–60 min |
+| Train | `atarra train <store> --bands 8 --epochs 40` | repeatedly, minutes |
+
+The build writes **tile shards**, not imagery: reflectance as uint16 at the archive's own 1e-4 scale, which round-trips exactly at a quarter of float32's size. (float16 would be smaller still, but carries ~3 significant digits at magnitude 1.0 — the same order as the red-edge differences that separate reed from cropland.) Training memory-maps the shards, so a store larger than RAM still works. The 8-band model and the 3-band RGB control arm are cut from the **same** store, so the multispectral-gain comparison costs no second download.
+
+Two parameters matter more than they look:
+
+- **`--gsd 20`** keeps twelve dates to 1.9 GB of composites. At 10 m it is 7.6 GB, which does not fit a free-tier session — `CompositeTileDataset` holds every composite in memory.
+- **`--stride 128`** overlaps tiles 2× for roughly 4× the training samples at no extra download cost, because imagery is fetched once and cut afterwards. Overlapping tiles share a spatial block and therefore land in the same split, so this does not leak.
+
+Store builds are refused outright rather than warned about when the grid was coarsened to fit `--max-size`, or when a second shard disagrees with the first about the grid. Either would produce a manifest that misdescribes its own shards.
+
+#### The labels measure agreement, not truth
+
+Training labels come from the weak-supervision rule engine in `datasets/weak_labels.py`, so a metric computed against them scores **agreement with that rule engine** — if the rules are wrong about a pixel, a model that reproduces them faithfully is still scored correct. Every `metrics.json` carries that caveat as a field, so the number cannot be quoted without it.
+
+Two related decisions were bugs first, and are worth stating:
+
+- The rule engine records every pixel it declined to be confident about. That mask is persisted alongside the tiles and *is* the annotation worklist: `TileStoreDataset.annotation_tiles()` ranks tiles by how much a human is needed and returns lon/lat corners for each, so the hardest cases open directly in QGIS. A handful of annotated tiles, held out, is what makes a defensible mIoU possible.
+- The loss mask is deliberately **not** the review mask. `REVIEW_THRESHOLD` is tuned for queue size, and the per-class scores saturate at different ceilings by design — the crop rule tops out at 0.597 against a 0.60 cut. Reusing it as a training filter deleted the **entire cropland class** by 0.003 of confidence, silently turning a 4-class problem into a 2-class one. Ambiguity is decided on **margin** instead (0.067 for a reed/crop coin flip, versus 0.23–0.52 for real decisions), and `test_every_class_survives_confidence_filtering` exists to keep it that way.
 
 ### Tests
 
@@ -148,9 +183,10 @@ These are the decisions that quietly determine whether reported metrics hold up.
 1. **Split train/validation/test by geography, never randomly.** Adjacent satellite tiles are heavily autocorrelated; a random split puts near-duplicates of test pixels in training and inflates mIoU into fiction.
 2. **A 3-band RGB baseline is trained on identical splits and seed.** This is how the spec's "multispectral gain" claim gets substantiated rather than asserted.
 3. **SCL masking happens before index computation.** Cloud, shadow, cirrus and snow otherwise enter the phenology features as spurious signal.
-4. **`numpy < 2` is pinned.** The installed CUDA PyTorch build is compiled against numpy 1.26.4; upgrading shadows it and breaks `import torch`.
+4. **`numpy < 2` is pinned locally, and only locally.** The development machine's CUDA PyTorch build is compiled against numpy 1.26.4, so `requirements.txt` caps it. That is a property of one machine, not of ATARRA: `pyproject.toml` declares no upper bound and `requirements-colab.txt` leaves numpy alone, because Colab ships 2.0.2 alongside a numpy-2-native torch and forcing the downgrade there would churn its preinstalled pandas/scipy for no reason.
 5. **The disk cache has a hard byte ceiling** with LRU eviction, reporting its size on every write.
-6. **Biomass is a proxy, not a measurement.** Canopy biomass cannot be observed directly from orbit; the harvest-window logic integrates NDVI/NDRE over the season as a documented proxy. Stated plainly rather than presented as ground truth.
+6. **Loss weights are computed from the training split alone.** Reed is ~1.8 % of pixels on real Burullus imagery, so unweighted cross-entropy is minimised by predicting "not reed" everywhere. The inverse-frequency correction is necessary — but computing it over the whole store imports the validation and test class balance into a training-time decision.
+7. **Biomass is a proxy, not a measurement.** Canopy biomass cannot be observed directly from orbit; the harvest-window logic integrates NDVI/NDRE over the season as a documented proxy. Stated plainly rather than presented as ground truth.
 
 ---
 

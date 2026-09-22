@@ -7,14 +7,19 @@ name = "atarra"
 version = "0.1.0"
 description = "Automated Tracking, Analysis, and Remediation Recommendation Architecture for aquatic invasive weeds using multispectral satellite telemetry and deep learning"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+# 3.11 is the development environment, but the upper bound must stay open:
+# Google Colab runs 3.12.13 and a `<3.12` cap makes `pip install -e .` fail on the
+# first cell of the training notebook. Nothing here is 3.11-specific.
+requires-python = ">=3.11"
 license = { text = "MIT" }
 
-# NOTE ON NUMPY: the CUDA PyTorch stack (2.6.0+cu124) already on this machine is
-# built against numpy 1.26.4. Upgrading numpy to 2.x shadows that build and breaks
-# `import torch`. The pin below is load-bearing, not cosmetic.
+# NOTE ON NUMPY: no upper bound is declared here on purpose. The `<2` constraint
+# belongs to one machine's CUDA torch build (2.6.0+cu124, compiled against numpy
+# 1.26.4), not to ATARRA -- Colab's torch 2.11 is numpy-2 native and forcing the
+# downgrade there would churn its preinstalled pandas/scipy pins for no reason.
+# The pin therefore lives in requirements.txt, which is the local install path.
 dependencies = [
-    "numpy>=1.24,<2",
+    "numpy>=1.24",
     "rasterio>=1.4",
     "pyproj>=3.6",
     "pyogrio>=0.10",
