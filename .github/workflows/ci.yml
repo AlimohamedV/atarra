@@ -35,10 +35,12 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # Pinned to 3.11, not 3.12+. pyproject declares `>=3.11,<3.12` because the
-          # geospatial wheel set (rasterio/GDAL bindings) is only reliably available
-          # for 3.11 here, and CI should match the declared support range rather
-          # than quietly test an unsupported interpreter.
+          # Pinned to 3.11 because that is the interpreter this project is
+          # developed and locally verified against. pyproject declares only
+          # `>=3.11`: the upper bound is deliberately open, because Colab runs
+          # 3.12.13 and a `<3.12` cap there would fail `pip install -e .` on the
+          # first cell of the training notebook. Adding a 3.12 leg to this job
+          # would cover the Colab interpreter; today it covers the declared floor.
           python-version: "3.11"
           cache: pip
           cache-dependency-path: |
