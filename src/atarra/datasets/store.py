@@ -103,8 +103,11 @@ class StoredTile:
     offset: int
     key: str
     block: tuple[int, int]
+    # The footprint, in grid pixels. Shaped like `tile_dataset.TileRecord` so the
+    # geographic splitter and the annotation holdout can share one implementation.
     row: int | None = None
     col: int | None = None
+    size: int | None = None
 
 
 def _shard_dir(root: Path, date: str) -> Path:
@@ -154,8 +157,12 @@ def write_shard(
         "tiles": int(images.shape[0]),
         "class_counts": counts,
         "trainable_px": int(trainable.sum()),
-        "usable_px": int(usable.sum()) if usable is not None else None,
-        "review_px": int(reviews.sum()) if reviews is not None else None,
+        # Summed over the stored tiles, which overlap each other by design (stride <
+        # tile size), so these double count shared ground and are diagnostics only.
+        # The manifest's `usable_px` / `review_px` are the unique-ground figures, and
+        # mixing the two bases is what once let a review *fraction* exceed 1.
+        "tile_usable_px": int(usable.sum()) if usable is not None else None,
+        "tile_review_px": int(reviews.sum()) if reviews is not None else None,
     }
 
 
@@ -314,9 +321,11 @@ def build_store(
             {
                 "coverage": round(float(composite.coverage), 4),
                 "scenes": len(composite.scene_ids),
-                "usable_px": int(composite.stack.valid.sum()),
             }
         )
+        # Counted once over the composite's own grid, not once per overlapping tile,
+        # so the review share derived from these stays a share of ground.
+        entry.update(tiled.pixel_totals())
         manifest["shards"].append(entry)
 
         log.info(
@@ -345,10 +354,14 @@ def build_store(
     manifest["totals"] = {
         "tiles": total_tiles,
         "shards": len(manifest["shards"]),
+        # Per tile, so overlapping pixels are counted more than once. This is the unit
+        # the class weights are derived from, where a uniform multiplier cancels.
         "class_counts": merged.tolist(),
         "trainable_px": int(sum(s["trainable_px"] for s in manifest["shards"])),
-        "usable_px": int(sum(s["usable_px"] or 0 for s in manifest["shards"])),
-        "review_px": int(sum(s["review_px"] or 0 for s in manifest["shards"])),
+        # Per date, on the common grid: the same ground counted once for each date it
+        # was observed, which is what a per-image normalisation decision needs.
+        "usable_px": int(sum(s.get("usable_px") or 0 for s in manifest["shards"])),
+        "review_px": int(sum(s.get("review_px") or 0 for s in manifest["shards"])),
     }
 
     (root / "manifest.json").write_text(
@@ -381,12 +394,45 @@ def load_manifest(root: Path | str) -> dict:
     return manifest
 
 
+def _open_optional(path: Path, *, mmap: bool = True) -> np.ndarray | None:
+    """Load an array that older stores may not have written."""
+    if not path.exists():
+        return None
+    return np.load(path, mmap_mode="r" if mmap else None)
+
+
+def _open_shards(root: Path, manifest: dict) -> list[dict]:
+    """Open every shard's arrays, memory-mapped so a large store stays on disk.
+
+    Shared by the constructor and by unpickling, so a worker process and the parent
+    agree on layout without either of them knowing how a store is written.
+    """
+    shards: list[dict] = []
+    for entry in manifest["shards"]:
+        directory = _shard_dir(root, entry["date"])
+        shards.append(
+            {
+                "images": np.load(directory / "image.npy", mmap_mode="r"),
+                "masks": np.load(directory / "mask.npy", mmap_mode="r"),
+                # All four are absent in stores written before they were persisted; such
+                # a store still trains, it just cannot offer an annotation worklist.
+                "reviews": _open_optional(directory / "review.npy"),
+                "valid": _open_optional(directory / "valid.npy"),
+                "rules": _open_optional(directory / "rule.npy"),
+                "offsets": _open_optional(directory / "offsets.npy", mmap=False),
+                "blocks": np.load(directory / "blocks.npy"),
+                "keys": json.loads((directory / "keys.json").read_text(encoding="utf-8")),
+                "date": entry["date"],
+            }
+        )
+    return shards
+
+
 class TileStoreDataset:
     """Memory-mapped view over a tile store, shaped like ``CompositeTileDataset``.
 
-    Keeps ``records`` objects exposing ``.block`` so ``geometric_split`` applies
-    unchanged, and returns the same item dict, so the trainer cannot tell the two
-    dataset types apart.
+    Records carry complete footprints so spatial splits and annotation holdouts
+    cover the same ground on every date.
     """
 
     def __init__(
@@ -397,12 +443,18 @@ class TileStoreDataset:
         augment: bool = False,
         seed: int = 0,
         holdout_keys: Sequence[str] | None = None,
+        holdout_buffer_pixels: int = 0,
     ) -> None:
         self.root = Path(root)
         self.manifest = load_manifest(self.root)
+        # The default for `as_torch_dataset` views. `__getitem__` is always raw.
         self.augment = augment
         self.seed = int(seed)
         self.holdout_keys = frozenset(holdout_keys or ())
+        self.holdout_buffer_pixels = int(holdout_buffer_pixels)
+        self.excluded_keys: list[str] = []
+        if self.holdout_buffer_pixels < 0:
+            raise AtarraError("the holdout buffer must be non-negative")
 
         stored = list(self.manifest["bands"])
         self.stored_bands = stored
@@ -416,54 +468,82 @@ class TileStoreDataset:
         self.band_names = requested
         self._channels = [stored.index(name) for name in requested]
 
-        self._shards: list[dict] = []
+        self._shards: list[dict] = _open_shards(self.root, self.manifest)
         self.records: list[StoredTile] = []
-        for shard_index, entry in enumerate(self.manifest["shards"]):
-            directory = _shard_dir(self.root, entry["date"])
-            images = np.load(directory / "image.npy", mmap_mode="r")
-            masks = np.load(directory / "mask.npy", mmap_mode="r")
-            blocks = np.load(directory / "blocks.npy")
-            keys = json.loads((directory / "keys.json").read_text(encoding="utf-8"))
-            # Absent in stores written before the review mask was persisted; such a
-            # store still trains, it just cannot offer its annotation worklist.
-            review_path = directory / "review.npy"
-            reviews = np.load(review_path, mmap_mode="r") if review_path.exists() else None
-            offset_path = directory / "offsets.npy"
-            offsets = np.load(offset_path) if offset_path.exists() else None
-            valid_path = directory / "valid.npy"
-            valid = np.load(valid_path, mmap_mode="r") if valid_path.exists() else None
-            rule_path = directory / "rule.npy"
-            rules = np.load(rule_path, mmap_mode="r") if rule_path.exists() else None
-            self._shards.append(
-                {
-                    "images": images,
-                    "masks": masks,
-                    "reviews": reviews,
-                    "valid": valid,
-                    "rules": rules,
-                    "date": entry["date"],
-                }
-            )
-            for offset in range(images.shape[0]):
-                # Reserved tiles are dropped here rather than filtered later, so that
-                # every downstream index and split covers only what may be trained on.
-                if keys[offset] in self.holdout_keys:
-                    continue
+        for shard_index, shard in enumerate(self._shards):
+            offsets = shard["offsets"]
+            blocks = shard["blocks"]
+            for offset, key in enumerate(shard["keys"]):
                 self.records.append(
                     StoredTile(
                         shard=shard_index,
                         offset=offset,
-                        key=keys[offset],
+                        key=key,
                         block=(int(blocks[offset, 0]), int(blocks[offset, 1])),
                         row=None if offsets is None else int(offsets[offset, 0]),
                         col=None if offsets is None else int(offsets[offset, 1]),
+                        size=int(self.manifest["tile_size"]),
                     )
                 )
+        self.filtered = False
+        if self._channels != list(range(len(stored))):
+            self.filtered = True
+
+        if self.holdout_keys:
+            from atarra.datasets.spatial import intersecting_bounds, tile_bounds
+
+            missing = self.holdout_keys - {record.key for record in self.records}
+            if missing:
+                raise AtarraError(
+                    f"reserved tiles are missing from this store: {sorted(missing)[:3]}; "
+                    "use the store from which the annotation pack was exported"
+                )
+            bounds = tile_bounds(self)
+            reserved = bounds[
+                [i for i, record in enumerate(self.records) if record.key in self.holdout_keys]
+            ]
+            excluded = intersecting_bounds(
+                bounds, reserved, buffer_pixels=self.holdout_buffer_pixels
+            )
+            self.excluded_keys = [
+                record.key for record, drop in zip(self.records, excluded) if drop
+            ]
+            self.records = [
+                record for record, drop in zip(self.records, excluded) if not drop
+            ]
+            self.filtered = True
+            if not self.records:
+                # Said here, with the numbers, because the alternative is a downstream
+                # complaint that the store is too small to split -- which names the
+                # symptom and not the cause, and invites widening an AOI that was never
+                # the problem. Measured on a 6-tile smoke store: a 3-tile pack with the
+                # default half-tile buffer excluded all six.
+                raise AtarraError(
+                    f"the reserved ground covers this whole store: {len(self.holdout_keys)} "
+                    f"reserved tile(s) took all {len(excluded)} tile(s) with them at a "
+                    f"{self.holdout_buffer_pixels}-pixel buffer. Reserve fewer tiles, "
+                    "lower `--holdout-buffer`, or build a larger store: there is nothing "
+                    "left to train on."
+                )
+
+    def __getstate__(self):
+        # Spawned DataLoader workers reopen mmap files instead of pickling their
+        # contents, which would copy the whole store into each worker's RAM.
+        state = self.__dict__.copy()
+        state["_shards"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # `spawn` pickles the dataset into each worker; reopening the maps there keeps
+        # the imagery on disk instead of duplicating it per worker.
+        self._shards = _open_shards(self.root, self.manifest)
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict:
+    def _image_and_mask(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Read raw model inputs without augmentation or annotation-only arrays."""
         record = self.records[index]
         shard = self._shards[record.shard]
 
@@ -473,11 +553,22 @@ class TileStoreDataset:
         # Invalid pixels are stored as -1 already, but re-assert it so a store written
         # by an older build cannot leak unlabelled pixels into the loss.
         mask = np.where(mask < 0, -1, mask)
+        return image, mask
 
-        if self.augment:
-            from atarra.datasets.tile_dataset import augment_tile
+    def __getitem__(self, index: int) -> dict:
+        """One tile as stored: never augmented.
 
-            image, mask = augment_tile(image, mask, seed=self.seed, index=index)
+        Augmentation lives on :meth:`as_torch_dataset` views and nowhere else, for two
+        reasons. The annotation arrays here (``usable``, ``rule_labels``, ``review``)
+        are not transformed by ``augment_tile``, so augmenting in place would leave the
+        review mask pointing at different ground than the imagery beside it -- and a
+        desynced worklist is worse than none. And an augmented read cannot be
+        reproducible, because the transform has to vary between epochs to be worth
+        anything, which a bare ``dataset[i]`` has no way to express.
+        """
+        record = self.records[index]
+        shard = self._shards[record.shard]
+        image, mask = self._image_and_mask(index)
 
         item = {
             "image": np.ascontiguousarray(image),
@@ -486,25 +577,20 @@ class TileStoreDataset:
             "block": record.block,
         }
 
-        if not self.augment:
-            # Annotation-support arrays, supplied only when nothing has been spatially
-            # transformed. `augment_tile` flips and rotates the image and mask, and these
-            # would stay put -- a desynced review mask would point an annotator at the
-            # wrong ground, which is worse than not having one.
-            valid = shard["valid"]
-            if valid is None:
-                raise AtarraError(
-                    f"tile {record.key} has no stored validity mask, so it cannot be "
-                    "exported for annotation. Rebuild the store. Training is unaffected."
-                )
-            item["usable"] = np.ascontiguousarray(valid[record.offset]).astype(bool)
-            rules = shard["rules"]
-            item["rule_labels"] = np.ascontiguousarray(
-                rules[record.offset] if rules is not None else mask
-            ).astype(np.int64)
-            reviews = shard["reviews"]
-            if reviews is not None:
-                item["review"] = np.ascontiguousarray(reviews[record.offset]).astype(bool)
+        valid = shard["valid"]
+        if valid is None:
+            raise AtarraError(
+                f"tile {record.key} has no stored validity mask, so it cannot be "
+                "exported for annotation. Rebuild the store. Training is unaffected."
+            )
+        item["usable"] = np.ascontiguousarray(valid[record.offset]).astype(bool)
+        rules = shard["rules"]
+        item["rule_labels"] = np.ascontiguousarray(
+            rules[record.offset] if rules is not None else mask
+        ).astype(np.int64)
+        reviews = shard["reviews"]
+        if reviews is not None:
+            item["review"] = np.ascontiguousarray(reviews[record.offset]).astype(bool)
         return item
 
     def grid(self):
@@ -595,7 +681,13 @@ class TileStoreDataset:
         return np.asarray(reviews[record.offset], dtype=bool)
 
     def review_fraction(self) -> float | None:
-        """Share of stored pixels awaiting human adjudication, or None if unknown."""
+        """Share of observed ground awaiting human adjudication, or None if unknown.
+
+        Only defined for the whole store: both terms are unique-ground, per-date counts,
+        so excluding a holdout would leave a ratio across two different areas.
+        """
+        if self.filtered:
+            return None
         totals = self.manifest["totals"]
         total = totals.get("review_px")
         usable = totals.get("usable_px")
@@ -603,7 +695,7 @@ class TileStoreDataset:
             return None
         # Over usable pixels: review is a subset of usable, so the frame's empty
         # corners must not be in the denominator.
-        return round(total / max(1, usable), 5)
+        return round(min(1.0, total / max(1, usable)), 5)
 
     def class_counts(self, indices: Sequence[int] | None = None) -> np.ndarray:
         """Pixel tally per class, optionally restricted to a subset of tiles.
@@ -613,8 +705,10 @@ class TileStoreDataset:
         decision, which is the subtle kind of leakage that makes a held-out score
         look better than the model is.
         """
-        if indices is None:
+        if indices is None and len(self.records) == self.manifest["totals"]["tiles"]:
             return np.array(self.manifest["totals"]["class_counts"], dtype=np.int64)
+        if indices is None:
+            indices = range(len(self.records))
 
         counts = np.zeros(len(self.manifest["totals"]["class_counts"]), dtype=np.int64)
         by_shard: dict[int, list[tuple[int, int]]] = {}
@@ -647,43 +741,59 @@ class TileStoreDataset:
         counts = self.class_counts(indices)
         return class_weights_from_counts(counts, scheme=scheme)
 
-    def as_torch_dataset(self):
-        """Wrap as a ``torch.utils.data.Dataset`` yielding tensors."""
-        import torch
+    def as_torch_dataset(
+        self, *, indices: Sequence[int] | None = None, augment: bool | None = None
+    ):
+        """Create an independent view; only the training view enables augmentation."""
+        return _TorchTileDataset(
+            self,
+            list(range(len(self))) if indices is None else list(indices),
+            self.augment if augment is None else augment,
+        )
 
-        dataset = self
+    def band_statistics(
+        self, sample_limit: int = 200, *, indices: Sequence[int] | None = None
+    ) -> dict:
+        """Stream raw, usable pixels from the supplied split into per-band moments.
 
-        class _TorchDataset(torch.utils.data.Dataset):
-            def __len__(self) -> int:
-                return len(dataset)
-
-            def __getitem__(self, index: int):
-                sample = dataset[index]
-                return {
-                    "image": torch.from_numpy(sample["image"]),
-                    "mask": torch.from_numpy(sample["mask"]),
-                }
-
-        return _TorchDataset()
-
-    def band_statistics(self, sample_limit: int = 200) -> dict:
-        """Per-band mean/std over a sample of tiles.
-
-        Feeds the model's normalisation buffers. Sampling rather than sweeping every
-        tile keeps this cheap on a store that may not fit in RAM.
+        No augmentation or held-out tile can affect training statistics. The
+        accumulator uses one tile at a time, even when the store exceeds RAM.
         """
-        if not len(self.records):
-            raise AtarraError("store has no tiles")
-        step = max(1, len(self.records) // max(1, sample_limit))
-        stacked: list[np.ndarray] = []
-        for index in range(0, len(self.records), step):
-            stacked.append(self[index]["image"])
-        block = np.concatenate([a.reshape(a.shape[0], -1) for a in stacked], axis=1)
+        eligible = np.asarray(list(range(len(self))) if indices is None else list(indices))
+        if not len(eligible):
+            raise AtarraError("no tiles available for band statistics")
+        if sample_limit < 1:
+            raise AtarraError("sample_limit must be positive")
+        positions = np.linspace(0, len(eligible) - 1, min(sample_limit, len(eligible)), dtype=int)
+        sampled = eligible[positions]
+        count = 0
+        mean = np.zeros(len(self.band_names), dtype=np.float64)
+        m2 = np.zeros_like(mean)
+        for index in sampled:
+            record = self.records[index]
+            image, mask = self._image_and_mask(index)
+            valid = self._shards[record.shard]["valid"]
+            usable = mask >= 0 if valid is None else np.asarray(valid[record.offset], dtype=bool)
+            usable = usable & np.isfinite(image).all(axis=0)
+            values = image[:, usable].astype(np.float64)
+            n = values.shape[1]
+            if not n:
+                continue
+            batch_mean = values.mean(axis=1)
+            delta = batch_mean - mean
+            m2 += ((values - batch_mean[:, None]) ** 2).sum(axis=1)
+            m2 += delta**2 * count * n / (count + n)
+            mean += delta * n / (count + n)
+            count += n
+        if not count:
+            raise AtarraError("sampled training tiles have no usable pixels for normalization")
         return {
-            "mean": block.mean(axis=1).round(6).tolist(),
-            "std": np.maximum(block.std(axis=1), 1e-4).round(6).tolist(),
+            "mean": mean.round(6).tolist(),
+            "std": np.maximum(np.sqrt(m2 / count), 1e-4).round(6).tolist(),
             "bands": list(self.band_names),
-            "sampled_tiles": len(stacked),
+            "sampled_tiles": len(sampled),
+            "usable_pixels": count,
+            "source": "raw usable pixels from the supplied tile subset",
         }
 
     def dates(self) -> list[str]:
@@ -777,7 +887,17 @@ class TileStoreDataset:
         ]
 
     def describe(self) -> dict:
+        """What this view covers, and which numbers describe *this view*.
+
+        The class tallies are counted over the retained tiles, so on a filtered view
+        the whole-store coverage figures beside them would describe different ground.
+        They are reported only for an unfiltered store, and named as per-tile tallies
+        besides, because a tile-pixel count and a count of ground are not the same
+        number when tiles overlap.
+        """
         totals = self.manifest["totals"]
+        counts = self.class_counts()
+        whole_store = not self.filtered
         return {
             "root": str(self.root),
             "area": self.manifest["area"],
@@ -788,12 +908,52 @@ class TileStoreDataset:
             "selected_bands": self.band_names,
             "shards": len(self.manifest["shards"]),
             "dates": self.dates(),
+            "scope": "whole store" if whole_store else "filtered view",
             "tiles": len(self.records),
-            "class_counts": totals["class_counts"],
-            "trainable_px": totals["trainable_px"],
-            "usable_px": totals.get("usable_px"),
-            "review_px": totals.get("review_px"),
+            "class_counts": counts.tolist(),
+            "class_counts_scope": (
+                "retained tiles, summed per tile (tiles overlap by stride)"
+                if not whole_store
+                else "all tiles, summed per tile (tiles overlap by stride)"
+            ),
+            "trainable_px": int(counts.sum()),
+            "holdout_tiles_excluded": len(self.excluded_keys),
+            # Unique ground, per date. `None` on a filtered view rather than a nearby
+            # number: the shape of the store changed and these did not.
+            "usable_px": totals.get("usable_px") if whole_store else None,
+            "review_px": totals.get("review_px") if whole_store else None,
             "review_fraction": self.review_fraction(),
+        }
+
+
+class _TorchTileDataset:
+    """Pickleable map-style view for both fork and spawn DataLoader workers."""
+
+    def __init__(self, dataset: TileStoreDataset, indices: list[int], augment: bool):
+        self.dataset = dataset
+        self.indices = indices
+        self.augment = bool(augment)
+        self.epoch = 0
+
+    def __len__(self):
+        return len(self.indices)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __getitem__(self, position: int):
+        import torch
+        from atarra.datasets.tile_dataset import augment_tile
+
+        index = self.indices[position]
+        image, mask = self.dataset._image_and_mask(index)
+        if self.augment:
+            image, mask = augment_tile(
+                image, mask, seed=self.dataset.seed, index=index, epoch=self.epoch
+            )
+        return {
+            "image": torch.from_numpy(np.ascontiguousarray(image)),
+            "mask": torch.from_numpy(np.ascontiguousarray(mask)),
         }
 
 

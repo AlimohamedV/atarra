@@ -270,6 +270,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         patience=args.patience,
         max_tiles=args.max_tiles,
         exclude_pack=args.exclude_pack,
+        split_buffer_pixels=args.split_buffer,
+        holdout_buffer_pixels=args.holdout_buffer,
     )
     print("\n" + format_report(metrics))
     return 0
@@ -319,6 +321,17 @@ def cmd_annotation_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def assessment_labels(result: dict) -> str:
+    """One line naming how well the held-out claim holds, for the score summary."""
+    status = result["assessment"]["independence"]["status"]
+    return {
+        "verified": "annotated ground confirmed unseen by the checkpoint",
+        "unverified": "UNVERIFIED: checkpoint records no provenance",
+        "used_for_selection": "LEAKED: annotated tiles helped select the checkpoint",
+        "trained_on": "VIOLATED: annotated tiles were trained on",
+    }.get(status, status)
+
+
 def cmd_annotation_score(args: argparse.Namespace) -> int:
     """Score a trained model against the human labels in a pack."""
     from atarra.datasets.export import score_annotation_pack
@@ -327,11 +340,14 @@ def cmd_annotation_score(args: argparse.Namespace) -> int:
         args.pack, args.checkpoint, device=args.device, write=not args.no_write
     )
     report = result["report"]
+    assessment = result["assessment"]
 
     print(f"scored {result['tiles_annotated']} annotated tile(s) of "
           f"{result['tiles_reserved']} reserved")
     print(f"  checkpoint     {result['checkpoint']}")
-    print(f"  bands          {result['bands']}")
+    print(f"  bands          {result['bands']}"
+          + ("" if result["band_order_verified"] else "  (order NOT verified)"))
+    print(f"  independence   {assessment_labels(result)}")
     print()
     print("independent report (against human labels, not the rule engine)")
     print(f"  mean IoU       {report['mean_iou']}")
@@ -351,7 +367,8 @@ def cmd_annotation_score(args: argparse.Namespace) -> int:
             print(f"  {entry['key']:<18} agreement {entry['agreement']:.3f}  "
                   f"labelled {entry['labelled_px']:,} px")
 
-    assessment = result["assessment"]
+    print()
+    print(assessment["independence"]["detail"])
     print()
     if result["assessable"]:
         targets = result["targets"]
@@ -494,6 +511,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default=None, help="cpu, cuda, or unset for automatic")
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--max-tiles", type=int, default=None, help="truncate for a smoke run")
+    p.add_argument(
+        "--split-buffer",
+        type=int,
+        default=None,
+        help="gap in pixels between the geographic splits (default: half a tile)",
+    )
+    p.add_argument(
+        "--holdout-buffer",
+        type=int,
+        default=None,
+        help="gap in pixels around excluded annotation ground (default: half a tile)",
+    )
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("cache", help="report or clear the composite cache")

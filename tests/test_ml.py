@@ -395,6 +395,30 @@ class TestModel:
         assert "band_mean" in dict(model.named_buffers())
         assert "band_std" in dict(model.named_buffers())
 
+    def test_the_rgb_control_arm_uses_the_supplied_statistics(self):
+        """The arms must differ in their band set and in nothing else.
+
+        Hard-coding the control arm's normalisation while the multispectral arm is
+        normalised from its own training split makes the measured gain part band set
+        and part invisible difference in preprocessing.
+        """
+        torch = pytest.importorskip("torch")
+        from atarra.models.segmentation import build_model
+
+        measured = build_model(
+            variant="rgb", base_channels=8, depth=3, band_mean=[0.11, 0.09, 0.07],
+            band_std=[0.04, 0.04, 0.03],
+        )
+        # The buffers are shaped (1, C, 1, 1) for broadcasting, so read them flat.
+        assert measured.band_mean.reshape(-1).tolist() == pytest.approx([0.11, 0.09, 0.07])
+        assert measured.band_std.reshape(-1).tolist() == pytest.approx([0.04, 0.04, 0.03])
+
+        # With nothing supplied the published defaults still apply, so the preset
+        # remains usable on its own.
+        defaulted = build_model(variant="rgb", base_channels=8, depth=3)
+        assert defaulted.band_mean.reshape(-1).tolist() == pytest.approx([0.12, 0.10, 0.08])
+        assert defaulted.in_channels == 3
+
     def test_zero_std_is_rejected(self):
         pytest.importorskip("torch")
         from atarra.core.errors import AtarraError

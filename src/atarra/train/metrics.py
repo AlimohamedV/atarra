@@ -147,10 +147,17 @@ def segmentation_report(
 
 
 def meets_targets(report: dict, *, iou: float = 0.82, f1: float = 0.85) -> dict:
-    """Check a report against the proposal's stated success criteria."""
+    """Check a report against the proposal's stated success criteria.
+
+    Only meaningful for a report measured against independent truth. Measured against
+    the rule engine that produced the training labels, passing says the model agrees
+    with its own teacher -- which is not the claim the proposal makes. Use
+    :func:`unassessable_targets` for those, so no verdict can be quoted from the file.
+    """
     reed_iou = report.get("phragmites_iou")
     reed_f1 = report.get("phragmites_f1")
     return {
+        "assessable": True,
         "target_iou": iou,
         "target_f1": f1,
         "iou_met": reed_iou is not None and reed_iou >= iou,
@@ -161,4 +168,22 @@ def meets_targets(report: dict, *, iou: float = 0.82, f1: float = 0.85) -> dict:
             and reed_iou >= iou
             and reed_f1 >= f1
         ),
+    }
+
+
+def unassessable_targets(reason: str, *, iou: float = 0.82, f1: float = 0.85) -> dict:
+    """Target flags for a score that is not a validation of the model.
+
+    ``both_met`` is ``None``, not ``False``: the point is that the comparison was never
+    made, and a boolean either way would be read as an answer. Anything printing this
+    has to say so instead.
+    """
+    return {
+        "assessable": False,
+        "target_iou": iou,
+        "target_f1": f1,
+        "iou_met": None,
+        "f1_met": None,
+        "both_met": None,
+        "reason": reason,
     }

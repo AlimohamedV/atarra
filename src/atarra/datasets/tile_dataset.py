@@ -53,18 +53,17 @@ def _tile_grid(width: int, height: int, size: int, stride: int | None) -> Iterat
 
 
 def augment_tile(
-    image: np.ndarray, mask: np.ndarray, *, seed: int, index: int
+    image: np.ndarray, mask: np.ndarray, *, seed: int, index: int, epoch: int = 0
 ) -> tuple[np.ndarray, np.ndarray]:
     """Random flips, right-angle rotations, and mild spectral jitter.
 
-    Seeded per index so a given tile augments identically across epochs. Fully
-    random augmentation would make the validation split non-reproducible, which
-    quietly destroys the ability to compare two runs.
+    Training transforms vary by epoch and remain reproducible for a fixed seed.
+    Validation and test views never call this function.
 
     Module-level rather than a method because the on-disk tile store needs exactly
     this transformation, and two implementations of "the same" augmentation drift.
     """
-    rng = np.random.default_rng(seed + index)
+    rng = np.random.default_rng(np.random.SeedSequence([seed, index, epoch]))
 
     if rng.random() < 0.5:
         image, mask = image[:, :, ::-1], mask[:, ::-1]
@@ -239,6 +238,19 @@ class CompositeTileDataset:
     def _augment(self, image: np.ndarray, mask: np.ndarray, index: int) -> tuple[np.ndarray, np.ndarray]:
         return augment_tile(image, mask, seed=self.seed, index=index)
 
+    def pixel_totals(self) -> dict:
+        """Unique-ground pixel tallies, counted once per composite rather than per tile.
+
+        The rule engine already ran over each composite in full, so these come from
+        that pass instead of from a union of overlapping tiles. Tiles overlap by
+        design (stride < tile size), so summing over them would inflate both counts --
+        and inflate them unevenly, since edge tiles cover less ground.
+        """
+        return {
+            "usable_px": int(sum(np.count_nonzero(item["usable"]) for item in self._labelled)),
+            "review_px": int(sum(np.count_nonzero(item["review"]) for item in self._labelled)),
+        }
+
     def index_statistics(self) -> dict:
         """Class balance across every tile, to set loss weights sensibly."""
         counts = np.zeros(4, dtype=np.int64)
@@ -273,61 +285,89 @@ class CompositeTileDataset:
 
 
 def geometric_split(
-    dataset: CompositeTileDataset,
+    dataset,
     *,
     fractions: tuple[float, float, float] = (0.70, 0.15, 0.15),
     seed: int = 0,
-) -> dict[str, list[int]]:
-    """Split tiles by contiguous spatial block, never at random.
+    buffer_pixels: int | None = None,
+) -> SpatialSplit:
+    """Partition complete footprints into contiguous regions, keeping dates together.
 
-    Whole tile-blocks are assigned to a split, so no test tile is adjacent to a
-    training tile. Returns index lists keyed ``train`` / ``val`` / ``test``.
+    Tiles crossing a boundary or its buffer are omitted from every split, and the
+    result is verified disjoint before it is returned. The default gap is half a tile
+    (``buffer_pixels=None``): a zero gap already prevents shared pixels, but tiles a
+    few hundred metres apart share weather, water level and phenology, so a buffer is
+    what keeps "held out" from meaning "held out except for its neighbours".
+
+    The gap actually applied is on the returned ``SpatialSplit.buffer_pixels``, since
+    it can be narrower than requested on a small store.
     """
-    if len(fractions) != 3 or abs(sum(fractions) - 1.0) > 1e-6:
-        raise AtarraError(f"fractions must be three values summing to 1, got {fractions}")
+    from atarra.datasets.spatial import (
+        SpatialSplit,
+        assert_disjoint,
+        split_bounds,
+        tile_bounds,
+    )
 
-    blocks: dict[tuple[int, int], list[int]] = {}
-    for index, record in enumerate(dataset.records):
-        blocks.setdefault(record.block, []).append(index)
+    if buffer_pixels is None:
+        size = getattr(dataset, "tile_size", None) or dataset.manifest.get("tile_size")
+        if not size:
+            raise AtarraError(
+                "cannot choose a default split buffer without a tile size; pass "
+                "buffer_pixels explicitly"
+            )
+        buffer_pixels = int(size) // 2
+    if buffer_pixels < 0:
+        raise AtarraError("the split buffer must be non-negative")
 
-    block_keys = sorted(blocks)
-    if len(block_keys) < 3:
-        raise AtarraError(
-            f"only {len(block_keys)} spatial block(s) available; a geometric split needs "
-            "at least 3. Use larger composites, or a smaller tile size, so the AOI "
-            "covers multiple blocks."
+    bounds = tile_bounds(dataset)
+    # Disjointness is the invariant and holds at any buffer >= 0; the buffer is the
+    # weaker claim that no test tile sits *next to* a training tile. A small store may
+    # not be able to afford the gap at all, and failing a long run over a quality knob
+    # would be worse than using a smaller one -- so the ladder walks down to zero and
+    # says so. It never widens beyond what the caller asked for.
+    attempt = buffer_pixels
+    ladder = [attempt]
+    while attempt > 0:
+        attempt //= 2
+        if attempt not in ladder:
+            ladder.append(attempt)
+
+    result = None
+    for attempt in ladder:
+        try:
+            result = split_bounds(
+                bounds, fractions=fractions, seed=seed, buffer_pixels=attempt
+            )
+            break
+        except AtarraError as error:
+            last_error = error
+    if result is None:
+        raise last_error  # type: ignore[possibly-undefined]
+    if attempt != buffer_pixels:
+        log.warning(
+            "a %d-pixel split gap leaves a region empty; using %d instead. Disjointness "
+            "still holds, but the splits are less separated than requested.",
+            buffer_pixels,
+            attempt,
         )
+    assert_disjoint(bounds, result)
 
-    # Deterministic shuffle: the same seed always yields the same partition, which
-    # is what makes two experiments comparable.
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(block_keys))
-
-    n_train = int(round(fractions[0] * len(block_keys)))
-    n_val = int(round(fractions[1] * len(block_keys)))
-    # Guarantee every split is non-empty; with few blocks the rounding can starve
-    # one otherwise.
-    n_train = max(1, min(n_train, len(block_keys) - 2))
-    n_val = max(1, min(n_val, len(block_keys) - n_train - 1))
-
-    splits = {
-        "train": order[:n_train],
-        "val": order[n_train : n_train + n_val],
-        "test": order[n_train + n_val :],
-    }
-
-    result: dict[str, list[int]] = {}
-    for name, positions in splits.items():
-        indices: list[int] = []
-        for position in positions:
-            indices.extend(blocks[block_keys[int(position)]])
-        result[name] = sorted(indices)
-
+    omitted = len(dataset.records) - sum(map(len, result.values()))
     log.info(
-        "geometric split over %d block(s): train=%d val=%d test=%d tiles",
-        len(block_keys),
+        "geographic split: train=%d val=%d test=%d tiles; %d boundary tile(s) omitted "
+        "by a %d-pixel (%.0f m) gap",
         len(result["train"]),
         len(result["val"]),
         len(result["test"]),
+        omitted,
+        attempt,
+        attempt * float(getattr(dataset, "gsd", 0) or _manifest_gsd(dataset)),
     )
     return result
+
+
+def _manifest_gsd(dataset) -> float:
+    """Ground sample distance for logging, or 0.0 when the dataset is not a store."""
+    manifest = getattr(dataset, "manifest", None) or {}
+    return float(manifest.get("gsd") or 0.0)

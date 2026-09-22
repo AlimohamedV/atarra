@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from atarra.core.errors import AtarraError
 from atarra.core.logging import get_logger
-from atarra.train.metrics import ConfusionAccumulator, segmentation_report
+from atarra.train.metrics import ConfusionAccumulator
 
 log = get_logger("train.trainer")
 
@@ -46,10 +46,19 @@ class TrainConfig:
     patience: int = 10
     grad_clip: float = 1.0
     ignore_index: int = IGNORE_INDEX
+    # Written into the checkpoint so inference can be checked against what the model
+    # was trained on. Empty band names mean "unknown", never "assume the caller is
+    # right" -- the scorer refuses to claim a verified band order without them.
+    band_names: list[str] = field(default_factory=list)
+    provenance: dict | None = None
 
     def as_dict(self) -> dict:
         data = asdict(self)
         data["output_dir"] = str(self.output_dir)
+        # Provenance carries one entry per training tile, so it belongs in the
+        # checkpoint -- which is what a scorer reads -- and not in the history file
+        # that every epoch rewrites.
+        data.pop("provenance", None)
         return data
 
 
@@ -90,11 +99,62 @@ def build_loss(class_weights: np.ndarray | None, device: torch.device) -> nn.Mod
     return nn.CrossEntropyLoss(weight=weights, ignore_index=IGNORE_INDEX)
 
 
-def _set_seed(seed: int) -> None:
+def set_seed(seed: int) -> None:
+    """Seed every generator a run depends on.
+
+    Called *before* the model is constructed: weight initialisation draws from the
+    torch RNG, so seeding afterwards leaves the starting weights dependent on whatever
+    the process happened to do first. Two runs of one configuration would then differ
+    from the very first step, which makes the reported metric irreproducible for a
+    reason that has nothing to do with the experiment.
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+
+
+def set_loader_epoch(loader, epoch: int) -> None:
+    """Advance any dataset that varies its augmentation by epoch.
+
+    Without this a tile is transformed identically in every epoch, so the model sees
+    the same "random" flips forty times -- augmentation that is fixed for the duration
+    of the run is not augmentation.
+    """
+    setter = getattr(getattr(loader, "dataset", None), "set_epoch", None)
+    if callable(setter):
+        setter(epoch)
+
+
+def _apply_step(optimizer, scaler, model, cfg: TrainConfig, group_size: int) -> None:
+    """Clip gradients and take one optimiser step for a group of ``group_size`` ones.
+
+    A final group that is not full is the normal case, not an edge case: it happens
+    whenever the tile count is not a multiple of ``batch_size * accumulate_steps``.
+    Each micro-batch in it divided its loss by ``accumulate_steps``, so the pending
+    gradient is a fraction of the mean over the batches actually present, and stepping
+    on it unscaled would shrink every weight proportionally to how few tiles were left
+    over.
+    """
+    if scaler is not None:
+        # Unscaling first, so the correction below is applied to real magnitudes and
+        # `scaler.step` sees an already-unscaled gradient and skips unscaling twice.
+        scaler.unscale_(optimizer)
+    if group_size < cfg.accumulate_steps:
+        factor = cfg.accumulate_steps / group_size
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
+    if cfg.grad_clip:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
 
 
 @torch.no_grad()
@@ -135,10 +195,16 @@ def train(
     device: torch.device | None = None,
     num_classes: int = 4,
 ) -> dict:
-    """Train a segmentation model and return the run history."""
+    """Train a segmentation model and return the run history.
+
+    Reseeds, then trains, then **restores the best epoch's weights** before it
+    evaluates, so the returned report and any later test score describe the checkpoint
+    on disk rather than the last epoch. Call :func:`set_seed` before constructing the
+    model as well: seeding here cannot retroactively fix weight initialisation.
+    """
     cfg = config or TrainConfig()
     device = device or resolve_device()
-    _set_seed(cfg.seed)
+    set_seed(cfg.seed)
     cfg.output_dir = Path(cfg.output_dir)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,12 +230,23 @@ def train(
         model.train()
         running_loss = 0.0
         batches = 0
+        skipped = 0
+        pending = 0
         start = time.time()
         optimizer.zero_grad(set_to_none=True)
+        set_loader_epoch(train_loader, epoch)
 
-        for step, batch in enumerate(train_loader, start=1):
+        for batch in train_loader:
             images = batch["image"].to(device, non_blocking=True).float()
             masks = batch["mask"].to(device, non_blocking=True).long()
+
+            # A tile whose every pixel is ignored -- all nodata, or every pixel flagged
+            # for review -- carries no gradient, and cross-entropy over an empty set is
+            # NaN. One such batch would write NaN into every weight, and the run would
+            # continue reporting a loss until it stopped improving on garbage.
+            if not bool((masks != cfg.ignore_index).any()):
+                skipped += 1
+                continue
 
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 logits = model(images)
@@ -177,27 +254,44 @@ def train(
                 if cfg.accumulate_steps > 1:
                     loss = loss / cfg.accumulate_steps
 
+            if not bool(torch.isfinite(loss.detach())):
+                raise AtarraError(
+                    f"non-finite loss at epoch {epoch}, batch {batches + skipped + 1}: "
+                    "refusing to continue, because the next checkpoint would contain "
+                    "NaNs and every metric after it would be meaningless"
+                )
+
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            pending += 1
 
-            if step % cfg.accumulate_steps == 0:
-                if cfg.grad_clip:
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                if scaler is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            if pending >= cfg.accumulate_steps:
+                _apply_step(optimizer, scaler, model, cfg, pending)
+                pending = 0
 
             running_loss += float(loss.detach()) * (
                 cfg.accumulate_steps if cfg.accumulate_steps > 1 else 1.0
             )
             batches += 1
+
+        if pending:
+            # Without this the last `pending` batches of every epoch are accumulated
+            # and then thrown away -- silently, and worst on a small store where the
+            # dropped fraction is largest.
+            _apply_step(optimizer, scaler, model, cfg, pending)
+            pending = 0
+
+        if not batches:
+            raise AtarraError(
+                f"epoch {epoch} had no batch containing a single supervised pixel "
+                f"({skipped} batch(es) skipped). There is nothing to fit. Check the "
+                "training split for usable labels: a store whose tiles are mostly "
+                "nodata, or flagged for review, provides no supervision at all."
+            )
+        if skipped:
+            log.info("epoch %d: skipped %d batch(es) with no usable label", epoch, skipped)
 
         scheduler.step()
         train_loss = running_loss / max(1, batches)
@@ -208,6 +302,8 @@ def train(
         entry = {
             "epoch": epoch,
             "train_loss": round(train_loss, 5),
+            "train_batches": batches,
+            "train_batches_skipped": skipped,
             "val_mean_iou": val_iou,
             "val_phragmites_iou": report["phragmites_iou"],
             "val_phragmites_f1": report["phragmites_f1"],
@@ -251,6 +347,23 @@ def train(
     }
 
     (cfg.output_dir / "history.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    # The run's headline number must describe the model that was *kept*. `best.pt` is
+    # written whenever validation improves, so evaluating the in-memory model would
+    # report whichever epoch happened to run last -- a model this loop deliberately
+    # rejected -- while the file beside the metrics held a different one.
+    best_path = cfg.output_dir / "best.pt"
+    if best_epoch > 0 and best_path.exists():
+        best_state = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(best_state["model_state"])
+        model.to(device)
+        log.info("restored epoch %d weights before final evaluation", best_epoch)
+    else:
+        log.warning(
+            "no best checkpoint was written, so final evaluation uses the last epoch's "
+            "weights; treat the report as provisional"
+        )
+    summary["evaluated_epoch"] = best_epoch if best_epoch > 0 else len(history)
     summary["final_report"] = evaluate(model, val_loader, num_classes=num_classes, device=device)
 
     log.info("best validation mIoU %.4f at epoch %d", best_iou, best_epoch)
@@ -277,6 +390,13 @@ def _save_checkpoint(
             "class_weights": None if class_weights is None else class_weights.tolist(),
             "in_channels": getattr(model, "in_channels", None),
             "num_classes": getattr(model, "num_classes", None),
+            # Ordered band names, because a channel *count* cannot tell a scorer whether
+            # it is holding B08 where the model expects B04: the array shape matches and
+            # every number is plausible. And training provenance, because the only way
+            # to know a held-out tile was never trained on is for the checkpoint to say
+            # which tiles those were.
+            "band_names": list(cfg.band_names),
+            "provenance": cfg.provenance,
         },
         path,
     )

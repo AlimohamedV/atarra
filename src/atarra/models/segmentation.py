@@ -178,17 +178,24 @@ def build_model(
 
     ``variant`` selects the architecture. ``rgb`` is a convenience that builds the
     3-channel baseline, which is the control arm of the multispectral experiment.
+
+    The RGB defaults are a fallback, not an override. When a caller supplies
+    statistics measured on its own training split, the control arm must use them: the
+    two arms are supposed to differ in their band set and in nothing else, and an arm
+    normalised by hard-coded constants is normalised by a second, invisible difference
+    -- which is then part of whatever gain the experiment reports.
     """
     key = variant.strip().lower()
     if key in {"rgb", "rgb_baseline"}:
-        red, green, blue = 0.12, 0.10, 0.08
+        mean = list(band_mean) if band_mean is not None else [0.12, 0.10, 0.08]
+        std = list(band_std) if band_std is not None else [0.06, 0.05, 0.04]
         return UNet(
             in_channels=3,
             num_classes=num_classes,
             base_channels=base_channels,
             depth=depth,
-            band_mean=[red, green, blue],
-            band_std=[0.06, 0.05, 0.04],
+            band_mean=mean,
+            band_std=std,
         )
     if key != "unet":
         raise AtarraError(f"unknown model variant {variant!r}; expected 'unet' or 'rgb'")

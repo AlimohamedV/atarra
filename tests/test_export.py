@@ -18,6 +18,7 @@ from atarra.datasets.export import (
     MIN_REED_PIXELS_FOR_IOU,
     UNLABELLED,
     _assess,
+    _check_independence,
     export_annotation_pack,
     load_annotations,
     load_pack,
@@ -75,6 +76,19 @@ def _tiny_checkpoint(path, *, in_channels: int):
     model = build_model(in_channels=in_channels)
     _save_checkpoint(path, model, TrainConfig(), 1, {"mean_iou": 0.0}, None)
     return model
+
+
+@pytest.fixture(scope="module")
+def scoring_checkpoint(tmp_path_factory):
+    """One checkpoint for the whole module: each is ~30 MB and nothing mutates it.
+
+    Module scope rather than per test because the full-width model is what makes the
+    file large, and pytest keeps several temp trees: a per-test copy adds tens of MB to
+    every run of this suite for no additional coverage.
+    """
+    path = tmp_path_factory.mktemp("checkpoints") / "best.pt"
+    _tiny_checkpoint(path, in_channels=len(BANDS))
+    return path
 
 
 @pytest.fixture
@@ -229,6 +243,11 @@ def _report(**support_by_class) -> dict:
     }
 
 
+def _verified() -> dict:
+    """An independence result that permits a verdict, for tests about other things."""
+    return {"status": "verified", "detail": "no annotated tile was trained on"}
+
+
 class TestAssessment:
     """Whether a score is a validation at all, decided before anyone quotes it.
 
@@ -238,28 +257,68 @@ class TestAssessment:
 
     def test_a_single_class_annotation_is_not_a_validation(self):
         """A model predicting that one class everywhere scores a perfect IoU."""
-        result = _assess(_report(phragmites_australis=32768), {PHRAGMITES_CODE})
+        result = _assess(
+            _report(phragmites_australis=32768), {PHRAGMITES_CODE}, _verified()
+        )
         assert result["assessable"] is False
         assert any("only 1 class" in reason for reason in result["blocking_reasons"])
         assert result["verdict"].startswith("NOT A VALIDATION")
 
     def test_too_few_reed_pixels_is_not_a_validation(self):
         report = _report(open_water=4000, crops_soil=4000, phragmites_australis=40)
-        result = _assess(report, {0, 1})
+        result = _assess(report, {0, 1}, _verified())
         assert result["assessable"] is False
         assert any("reed pixel" in reason for reason in result["blocking_reasons"])
         assert result["reed_support_px"] == 40
 
+    def test_unverifiable_independence_blocks_the_verdict(self):
+        """A textbook-perfect annotation on unverifiable ground is still not a result."""
+        report = _report(open_water=4000, crops_soil=4000, phragmites_australis=4000)
+        result = _assess(
+            report,
+            {0, 1, 3},
+            {"status": "unverified", "detail": "no provenance recorded"},
+        )
+        assert result["assessable"] is False
+        assert any("no provenance" in r for r in result["blocking_reasons"])
+
+
+class TestIndependence:
+    """The annotated ground must be shown unseen, not assumed unseen."""
+
+    def test_no_provenance_is_unverified_rather_than_innocent(self):
+        result = _check_independence({}, ["2024-08-20/c0/r0_c0"])
+        assert result["status"] == "unverified"
+
+    def test_a_trained_tile_is_reported_as_trained_on(self):
+        result = _check_independence(
+            {"train_keys": ["a", "b"], "val_keys": []}, ["b"]
+        )
+        assert result["status"] == "trained_on"
+
+    def test_a_validation_tile_is_reported_as_selection_leakage(self):
+        """Not trained on, but the checkpoint was chosen by its score there."""
+        result = _check_independence(
+            {"train_keys": ["a"], "val_keys": ["c"]}, ["c"]
+        )
+        assert result["status"] == "used_for_selection"
+
+    def test_disjoint_keys_verify(self):
+        result = _check_independence(
+            {"train_keys": ["a", "b"], "val_keys": ["c"]}, ["d", "e"]
+        )
+        assert result["status"] == "verified"
+
     def test_a_degenerate_prediction_is_caught(self):
         """One predicted class across a multi-class annotation is not a segmentation."""
         report = _report(open_water=2000, phragmites_australis=2000)
-        result = _assess(report, {0})
+        result = _assess(report, {0}, _verified())
         assert result["assessable"] is False
         assert any("single class" in reason for reason in result["blocking_reasons"])
 
     def test_a_covered_annotation_is_assessable(self):
         report = _report(open_water=2000, crops_soil=1000, phragmites_australis=2048)
-        result = _assess(report, {0, 1, 3})
+        result = _assess(report, {0, 1, 3}, _verified())
         assert result["assessable"] is True
         assert result["blocking_reasons"] == []
         assert result["classes_absent"] == ["mixed_halophytes"]
@@ -267,15 +326,14 @@ class TestAssessment:
 
 
 class TestLabels:
-    def test_scoring_refuses_when_nothing_has_been_annotated(self, tmp_path, pack):
+    def test_scoring_refuses_when_nothing_has_been_annotated(
+        self, tmp_path, pack, scoring_checkpoint
+    ):
         """The central safety property: never fall back to the rule engine."""
         pytest.importorskip("torch")
 
-        checkpoint = tmp_path / "best.pt"
-        _tiny_checkpoint(checkpoint, in_channels=len(BANDS))
-
         with pytest.raises(AtarraError, match="nothing in .* annotated"):
-            score_annotation_pack(tmp_path / "pack", checkpoint)
+            score_annotation_pack(tmp_path / "pack", scoring_checkpoint)
 
     def test_polygon_labels_are_reprojected_onto_the_chip(self, tmp_path, pack):
         """GeoJSON is WGS84; the chip is UTM. Rasterising without reprojecting is silent.
@@ -325,7 +383,9 @@ class TestLabels:
         assert 0.4 < coverage < 0.6, f"expected about half the tile, got {coverage:.1%}"
         assert set(np.unique(labels[labels < UNLABELLED])) == {PHRAGMITES_CODE}
 
-    def test_scoring_reports_against_the_human_labels(self, tmp_path, pack):
+    def test_scoring_reports_against_the_human_labels(
+        self, tmp_path, pack, scoring_checkpoint
+    ):
         pytest.importorskip("torch")
 
         pack_dir = tmp_path / "pack"
@@ -349,10 +409,7 @@ class TestLabels:
         ) as destination:
             destination.write(label_raster, 1)
 
-        checkpoint = tmp_path / "best.pt"
-        _tiny_checkpoint(checkpoint, in_channels=len(BANDS))
-
-        result = score_annotation_pack(pack_dir, checkpoint)
+        result = score_annotation_pack(pack_dir, scoring_checkpoint)
         assert result["tiles_annotated"] == 1
         assert len(result["tiles_still_unlabelled"]) == len(pack["tiles"]) - 1
         crops = next(

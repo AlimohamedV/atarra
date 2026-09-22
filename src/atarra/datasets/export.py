@@ -43,6 +43,14 @@ log = get_logger("datasets.export")
 PACK_VERSION = 1
 WGS84 = "EPSG:4326"
 
+#: The reflectance convention a pack's imagery is written in. Recorded in the pack so
+#: the scorer can tell a float chip from a stored-integer one instead of guessing --
+#: reading the wrong one scales every input without raising anything.
+CHIP_UNITS = "float32 reflectance, 1.0 = 100% reflectance"
+#: Reflectance is physically close to 1 at most. A value far above this is a stored
+#: integer (uint16 at 1e-4 scale reaches 10000), not a bright surface.
+MAX_PLAUSIBLE_REFLECTANCE = 2.0
+
 #: Below this many reed pixels across a pack, the per-class IoU is not a measurement.
 #: One run of this project reported "reed IoU 0.0" from 36 support pixels, which says
 #: nothing about the model. Reed is ~1.8% of this imagery, so a pack selected without
@@ -62,6 +70,27 @@ CLASS_COLORS = {
     3: (60, 150, 80, 255),  # phragmites      - green
 }
 REVIEW_COLORS = {0: (70, 70, 70, 255), 1: (230, 120, 40, 255)}
+
+
+def _as_reflectance(stack: np.ndarray, *, source: str) -> np.ndarray:
+    """Confirm a chip is in the pack's reflectance convention, or say what it is in.
+
+    The failure this guards against is silent: dividing an already-decoded chip by the
+    storage scale produces finite, well-shaped, plausible-looking inputs, and the model
+    answers them with a broadly plausible segmentation that happens to be wrong. The
+    score would read as a mediocre model rather than as a unit error.
+    """
+    if not stack.size:
+        raise AtarraError(f"{source} has no pixels")
+    peak = float(np.nanmax(stack))
+    if peak > MAX_PLAUSIBLE_REFLECTANCE:
+        raise AtarraError(
+            f"{source} holds values up to {peak:.4g}, which is not reflectance (the "
+            f"pack format is {CHIP_UNITS}). This looks like the stored-integer "
+            "convention; re-export the pack rather than scoring it, because the model "
+            "would receive inputs orders of magnitude outside its training range."
+        )
+    return stack
 
 
 def _safe_name(key: str) -> str:
@@ -268,6 +297,7 @@ def export_annotation_pack(
         "gsd": dataset.manifest["gsd"],
         "tile_size": int(dataset.manifest["tile_size"]),
         "imagery_bands": imagery_bands,
+        "imagery_units": CHIP_UNITS,
         "class_names": CLASS_NAMES,
         "phragmites_class_code": PHRAGMITES_CODE,
         "unlabelled_value": UNLABELLED,
@@ -515,7 +545,65 @@ def load_annotations(
     return None
 
 
-def _assess(report: dict, predicted_classes: set[int]) -> dict:
+def _check_independence(provenance: dict, pack_keys: Sequence[str]) -> dict:
+    """Decide whether the annotated ground can be *shown* to be unseen.
+
+    An annotation pack only measures detection if the model never saw its ground --
+    during training, or while its checkpoint was being chosen. The two failures differ
+    and are reported apart: training on it makes the score meaningless, whereas
+    selecting the checkpoint on it makes the score optimistic while still describing
+    the model's ability. Neither can be checked without the checkpoint's own record of
+    which tiles went where, so an older checkpoint is reported as unverified rather
+    than assumed innocent.
+    """
+    annotated = set(pack_keys)
+    trained = provenance.get("train_keys")
+    validated = provenance.get("val_keys")
+    if not trained and not validated:
+        return {
+            "status": "unverified",
+            "detail": (
+                "the checkpoint records no split provenance, so nothing here shows the "
+                "annotated ground was excluded from training or from checkpoint "
+                "selection. It may have been; it cannot be demonstrated. Re-run "
+                "`atarra train` to record it."
+            ),
+        }
+
+    overlap = sorted(annotated & set(trained or ()))
+    if overlap:
+        return {
+            "status": "trained_on",
+            "detail": (
+                f"{len(overlap)} annotated tile(s) are in the checkpoint's training "
+                f"split, e.g. {overlap[0]}. These metrics measure recall of ground the "
+                "model was fitted on, which is not detection accuracy."
+            ),
+        }
+
+    selected_on = sorted(annotated & set(validated or ()))
+    if selected_on:
+        return {
+            "status": "used_for_selection",
+            "detail": (
+                f"{len(selected_on)} annotated tile(s) are in the checkpoint's "
+                f"validation split, e.g. {selected_on[0]}, and the checkpoint was "
+                "chosen by its score there. The model did not train on them, but the "
+                "score is optimistic rather than held out."
+            ),
+        }
+
+    return {
+        "status": "verified",
+        "detail": (
+            f"none of the {len(annotated)} annotated tile(s) appears in the "
+            "checkpoint's training or validation splits."
+        ),
+        "checkpoint_train_tiles": len(trained or ()),
+    }
+
+
+def _assess(report: dict, predicted_classes: set[int], independence: dict) -> dict:
     """Decide whether a score is a validation at all, before anyone quotes it.
 
     A report can be arithmetically perfect and completely empty. Labelling a single
@@ -524,8 +612,9 @@ def _assess(report: dict, predicted_classes: set[int]) -> dict:
     handful of reed pixels happens to land under a uniform prediction.
 
     So the numbers are only called a validation when the annotations actually cover
-    more than one class and contain enough of the target class to measure. Otherwise
-    the reason is stated instead of the pass.
+    more than one class, contain enough of the target class to measure, and are on
+    ground the checkpoint cannot be shown to have seen. Otherwise the reason is stated
+    instead of the pass.
     """
     support = {entry["class_name"]: int(entry["support_px"]) for entry in report["per_class"]}
     present = [name for name, pixels in support.items() if pixels > 0]
@@ -533,6 +622,8 @@ def _assess(report: dict, predicted_classes: set[int]) -> dict:
     reed_support = support.get("phragmites_australis", 0)
 
     blocking: list[str] = []
+    if independence["status"] != "verified":
+        blocking.append(independence["detail"])
     if len(present) < 2:
         blocking.append(
             f"the annotations cover only {len(present)} class(es) "
@@ -578,6 +669,7 @@ def _assess(report: dict, predicted_classes: set[int]) -> dict:
         "reed_support_px": reed_support,
         "predicted_classes": sorted(int(c) for c in predicted_classes),
         "min_reed_pixels": MIN_REED_PIXELS_FOR_IOU,
+        "independence": independence,
     }
 
 
@@ -600,9 +692,12 @@ def score_annotation_pack(
 
     import torch
 
-    from atarra.datasets.store import decode_reflectance
     from atarra.models.segmentation import build_model
-    from atarra.train.metrics import ConfusionAccumulator, meets_targets
+    from atarra.train.metrics import (
+        ConfusionAccumulator,
+        meets_targets,
+        unassessable_targets,
+    )
     from atarra.train.trainer import load_checkpoint, resolve_device
 
     pack_dir = Path(pack_dir)
@@ -621,6 +716,33 @@ def score_annotation_pack(
             f"checkpoint expects {expected} input channels but the pack holds {len(bands)} "
             f"bands {bands}. Export the pack with the band set the model was trained on "
             "(`--bands`), or score with a matching checkpoint."
+        )
+
+    # Order matters as much as the count. Eight channels of the right shape in the wrong
+    # order is not a shape error the framework can catch -- B08 where B04 belongs
+    # produces a confident, entirely wrong answer -- so it is checked against the band
+    # names the checkpoint was written with, and named as unverifiable when absent.
+    trained_bands = metadata.get("band_names")
+    if trained_bands and list(trained_bands) != bands:
+        raise AtarraError(
+            f"the checkpoint was trained on bands {list(trained_bands)} but this pack "
+            f"holds {bands}. The channel count matches, so scoring would proceed and be "
+            "wrong. Re-export the pack with the training band set."
+        )
+    if not trained_bands:
+        log.warning(
+            "this checkpoint predates recorded band names, so the chip's band order "
+            "cannot be checked against the model's inputs; the channel count is the "
+            "only agreement available"
+        )
+
+    independence = _check_independence(
+        metadata.get("provenance") or {}, [tile["key"] for tile in pack["tiles"]]
+    )
+    if independence["status"] == "trained_on":
+        raise AtarraError(
+            f"refusing to score: {independence['detail']} Exclude the pack's ground from "
+            "training (`atarra train --exclude-pack`) and score that run instead."
         )
 
     model = build_model(in_channels=len(bands), num_classes=NUM_CLASSES, variant="unet")
@@ -655,7 +777,12 @@ def score_annotation_pack(
                 "verified; re-export the pack"
             )
         order = [descriptions.index(name) for name in missing_channels]
-        image = decode_reflectance(stack)[order]
+        # The chips are written *as* reflectance -- see the `_write_raster` call in
+        # `export_annotation_pack` -- and the model's normalisation buffers were fitted
+        # to that convention. Decoding a second time divides an already-decoded 0.2 by
+        # 10,000: no exception, no shape change, just inputs four orders of magnitude
+        # below anything the model trained on, scoring like a much worse model.
+        image = _as_reflectance(stack, source=chip_path.name)[order]
 
         labels = load_annotations(
             pack_dir, key, shape=shape, transform=grid_transform, crs=crs
@@ -701,25 +828,34 @@ def score_annotation_pack(
         )
 
     report = accumulator.report()
-    assessment = _assess(report, predicted_classes)
+    assessment = _assess(report, predicted_classes, independence)
     result = {
         "pack": str(pack_dir),
         "checkpoint": str(checkpoint),
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "device": str(resolved),
         "bands": bands,
+        "band_order_verified": bool(trained_bands),
         "tiles_reserved": len(pack["tiles"]),
         "tiles_annotated": annotated,
         "tiles_still_unlabelled": missing,
         "report": report,
-        "targets": meets_targets(report),
+        # A verdict, or an explicit statement that none was reached. Never a boolean
+        # standing in for a comparison that did not happen.
+        "targets": (
+            meets_targets(report)
+            if assessment["assessable"]
+            else unassessable_targets(assessment["verdict"])
+        ),
         "assessable": assessment["assessable"],
         "assessment": assessment,
         "per_tile": per_tile,
         "truth": (
             "Scored against human annotations in labels/, not against the rule engine. "
             "This is an independent measure of detection accuracy -- provided the "
-            "annotations actually cover enough classes; see `assessable`."
+            "annotations cover enough classes and the checkpoint can be shown never to "
+            "have seen this ground; see `assessable` and "
+            "`assessment.independence`."
         ),
     }
 
