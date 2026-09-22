@@ -284,6 +284,84 @@ class TestWeakLabels:
         assert result["trainable"].mean() < 0.1, "but the loss must not learn from it"
         assert result["review"].mean() > 0.9, "it belongs in the annotation queue"
 
+    # The measured signature of sediment-laden water in Lake Burullus, 14 July 2026,
+    # derived from stored reflectance: B02 0.175, B03 0.193, B04 0.188, B05 0.216,
+    # B08 0.181, B11 0.163. NDWI barely clears zero and NDRE is negative -- the lagoon
+    # is shallow, so suspended sediment and the bed scatter NIR back and the water
+    # index that the whole rule rests on goes quiet exactly where the class matters.
+    TURBID_WATER = {"ndvi": -0.021, "ndwi": 0.033, "ndre": -0.0882, "ndmi": 0.0523}
+
+    def test_sediment_laden_water_reaches_the_loss(self, simple_grid):
+        """Turbid water must be labelled as water *and* supervised on.
+
+        Regression test with the real numbers behind it. The water score used to be
+        `0.65 * wet + 0.35 * not_green`, and with NDWI at 0.03 the wetness term
+        contributed nothing, leaving a bare 0.35. The crop score paid out 0.30 for the
+        mere *absence* of a red edge -- which is not evidence of cropland, since water,
+        shadow and cloud all lack one too -- so the two tied at 0.35 against 0.30. A
+        0.05 margin is under the 0.08 ambiguity cut, so the engine dropped the lagoon
+        from the loss as ambiguous rather than labelling it. Over the 273-tile Burullus
+        store that withheld 2,431,960 px, +24.8% of the trainable ground, and it showed
+        up as a model predicting cropland across open water.
+        """
+        result = weak_label(self._uniform_indices(simple_grid, **self.TURBID_WATER))
+        assert (result["labels"] == OPEN_WATER).all(), "turbid water is still water"
+        assert result["trainable"].all(), (
+            "sediment-laden water must reach the loss; withholding it is what left the "
+            "model labelling the lagoon as cropland"
+        )
+        # The absence of a red edge is admitted as water evidence, but it is the
+        # weakest term and cannot stand alone: fully turbid water lands mid-scale.
+        assert result["scores"][CROPS_SOIL].max() == 0.0, (
+            "a wet, non-vegetated pixel is not cropland; the crop rule must not be "
+            "satisfied by an absence"
+        )
+        assert result["review"].all(), (
+            "mid-scale confidence still belongs in the human review queue"
+        )
+
+    def test_the_turbid_water_rule_has_a_negative_control(self, simple_grid, monkeypatch):
+        """Prove the test above can fail, by reinstating the superseded scorers.
+
+        A guard that cannot fail tests nothing. On the same measured spectrum the old
+        formulas must send the ground back out of the loss.
+        """
+        from atarra.datasets import weak_labels as module
+
+        def superseded_water(ndvi, ndwi, ndre, cfg):
+            wet = np.clip((ndwi - cfg.water_ndwi) / 0.35, 0.0, 1.0)
+            not_green = np.clip((cfg.vegetation_ndvi - ndvi) / 0.35, 0.0, 1.0)
+            return np.clip(0.65 * wet + 0.35 * not_green, 0.0, 1.0)
+
+        def superseded_crops(ndvi, ndre, ndwi, cfg):
+            vigour = np.clip((ndvi - cfg.vegetation_ndvi) / 0.35, 0.0, 1.0)
+            dry = np.clip((0.0 - ndwi) / 0.35, 0.0, 1.0)
+            less_red_edge = np.clip((cfg.reed_ndre - ndre) / 0.25, 0.0, 1.0)
+            return np.clip(0.45 * vigour + 0.25 * dry + 0.30 * less_red_edge, 0.0, 1.0)
+
+        monkeypatch.setattr(module, "_water_score", superseded_water)
+        monkeypatch.setattr(module, "_crops_score", superseded_crops)
+        result = weak_label(self._uniform_indices(simple_grid, **self.TURBID_WATER))
+        assert not result["trainable"].all(), (
+            "with the old scorers restored this ground must be dropped again, otherwise "
+            "the regression test above is decoration"
+        )
+        assert result["ambiguous"].all()
+
+    def test_real_cropland_is_not_stolen_by_the_turbidity_term(self, simple_grid):
+        """Widening the water rule must not cost the crop class any ground.
+
+        A vigorous, dry crop is the case the red-edge term exists for. Gating that
+        term behind actual evidence barely moves it (0.597 to 0.592) and must leave
+        the label and its place in the loss untouched.
+        """
+        result = weak_label(
+            self._uniform_indices(simple_grid, ndvi=0.62, ndre=0.25, ndmi=0.08, ndwi=-0.30)
+        )
+        assert (result["labels"] == CROPS_SOIL).all()
+        assert result["trainable"].all()
+        assert result["scores"][OPEN_WATER].max() == 0.0, "cropland is not water"
+
     def test_trainable_never_exceeds_usable(self, veg_water_stack):
         indices = compute_indices(veg_water_stack)
         result = weak_label(indices, valid=veg_water_stack.valid)

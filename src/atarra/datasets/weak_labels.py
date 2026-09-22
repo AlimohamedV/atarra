@@ -60,6 +60,9 @@ class WeakLabelConfig:
     """Thresholds for the rule engine. All are tunable against review data."""
 
     water_ndwi: float = 0.10
+    # At or below this NDRE the red edge is not rising, which over a shallow lagoon
+    # is what sediment-laden water looks like. See `_water_score`.
+    water_ndre_ceiling: float = 0.0
     vegetation_ndvi: float = 0.35
     # Red-edge contrast: dense intact canopy versus cropland.
     reed_ndre: float = 0.28
@@ -86,15 +89,32 @@ class WeakLabelConfig:
     notes: list[str] = field(default_factory=list)
 
 
-def _water_score(ndvi: np.ndarray, ndwi: np.ndarray, cfg: WeakLabelConfig) -> np.ndarray:
-    """Confidence that a pixel is open water.
+def _water_score(
+    ndvi: np.ndarray, ndwi: np.ndarray, ndre: np.ndarray, cfg: WeakLabelConfig
+) -> np.ndarray:
+    """Confidence that a pixel is open water, including turbid shallow water.
 
-    High NDWI is the primary signal; low NDVI corroborates it, which matters over
-    turbid delta water where NDWI alone weakens.
+    High NDWI is the primary signal and low NDVI corroborates it, but in a shallow
+    delta lagoon neither is reliable on its own. Suspended sediment and the lake bed
+    scatter near-infrared back to the sensor, which drags NDWI toward zero and makes
+    sediment-laden water look like dry ground to an index designed around clear water.
+
+    Measured on Burullus, 14 July 2026, over a real water body: NDWI **+0.03** with NIR
+    at **0.94x** green. The wetness term contributes exactly zero there -- the one place
+    the class matters most -- and the whole score rested on `not_green`, a bare 0.35.
+
+    What survives turbidity is the spectral shape. Sediment scattering gives a smooth,
+    flat-to-falling spectrum across the red edge, while any vegetation -- reed, crop,
+    halophyte -- raises it. So a flat or falling NDRE is admitted as water evidence. It
+    is deliberately the weakest of the three terms: it is an absence, and an absence
+    never proves water on its own. `wet` is the only term that reaches full strength
+    unaccompanied, so fully turbid water lands mid-scale and keeps its place in the
+    human review queue instead of being promoted to a confident label.
     """
     wet = np.clip((ndwi - cfg.water_ndwi) / 0.35, 0.0, 1.0)
     not_green = np.clip((cfg.vegetation_ndvi - ndvi) / 0.35, 0.0, 1.0)
-    return np.clip(0.65 * wet + 0.35 * not_green, 0.0, 1.0)
+    no_red_edge = np.clip((cfg.water_ndre_ceiling - ndre) / 0.15, 0.0, 1.0)
+    return np.clip(0.45 * wet + 0.30 * not_green + 0.25 * no_red_edge, 0.0, 1.0)
 
 
 def _phragmites_score(
@@ -126,7 +146,13 @@ def _crops_score(
     vigour = np.clip((ndvi - cfg.vegetation_ndvi) / 0.35, 0.0, 1.0)
     dry = np.clip((0.0 - ndwi) / 0.35, 0.0, 1.0)
     less_red_edge = np.clip((cfg.reed_ndre - ndre) / 0.25, 0.0, 1.0)
-    return np.clip(0.45 * vigour + 0.25 * dry + 0.30 * less_red_edge, 0.0, 1.0)
+    # `less_red_edge` is an *absence*, and an absence is not evidence of cropland:
+    # dark turbid water, cloud shadow and open water all lack a red edge too. Paid out
+    # unconditionally it handed every such pixel a flat 0.30, which tied water (0.35)
+    # to crops (0.30) inside a 0.05 margin and dropped the lagoon from the loss as
+    # ambiguous. It now only amplifies evidence that is independently present.
+    evidence = np.maximum(vigour, dry)
+    return np.clip(0.45 * vigour + 0.25 * dry + 0.30 * less_red_edge * evidence, 0.0, 1.0)
 
 
 def _halophyte_score(
@@ -173,7 +199,7 @@ def weak_label(
     ndmi = np.asarray(indices["ndmi"], dtype=np.float32)
 
     scores = {
-        OPEN_WATER: _water_score(ndvi, ndwi, cfg),
+        OPEN_WATER: _water_score(ndvi, ndwi, ndre, cfg),
         CROPS_SOIL: _crops_score(ndvi, ndre, ndwi, cfg),
         MIXED_HALOPHYTES: _halophyte_score(ndvi, ndre, ndwi, cfg),
         PHRAGMITES: _phragmites_score(ndvi, ndre, ndmi, ndwi, cfg),
