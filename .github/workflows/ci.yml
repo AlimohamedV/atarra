@@ -38,8 +38,8 @@ jobs:
           # Pinned to 3.11 because that is the interpreter this project is
           # developed and locally verified against. pyproject declares only
           # `>=3.11`: the upper bound is deliberately open, because Colab runs
-          # 3.12.13 and a `<3.12` cap there would fail `pip install -e .` on the
-          # first cell of the training notebook. Adding a 3.12 leg to this job
+          # 3.13.15 and a `<3.12` cap there would fail `pip install -e .` on the
+          # first cell of the training notebook. Adding a 3.13 leg to this job
           # would cover the Colab interpreter; today it covers the declared floor.
           python-version: "3.11"
           cache: pip

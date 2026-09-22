@@ -8,7 +8,7 @@
 #
 #  1. numpy. requirements.txt caps numpy at <2 because the CUDA torch build on the
 #     development laptop (2.6.0+cu124) is compiled against numpy 1.26.4. Colab
-#     ships numpy 2.0.2 and a torch that is numpy-2 native, so that cap would
+#     ships numpy 2.x (2.1.3 measured) and a torch that is numpy-2 native, so that cap
 #     downgrade numpy and pull Colab's preinstalled pandas/scipy away from the
 #     versions the runtime is pinned to. numpy is left alone here.
 #
@@ -18,12 +18,13 @@
 #     deliberately absent -- the two install commands above use --no-deps to stop
 #     setuptools from re-resolving it.
 #
-#  3. Python version. Colab runs 3.12.13. pyproject.toml declares `>=3.11` with no
+#  3. Python version. Colab runs 3.13.15. pyproject.toml declares `>=3.11` with no
 #     upper bound so that `pip install -e .` is accepted there.
 #
-# Verified against the Colab runtime as documented at
-# https://research.google.com/colaboratory/runtime-version-faq.html
-# (Python 3.12.13, numpy 2.0.2, PyTorch 2.11.0).
+# Measured on a live T4 Colab runtime on 2026-09-22 rather than taken from the
+# published FAQ: the FAQ said 3.12.13 / numpy 2.0.2, while the running image was
+# Python 3.13.15, numpy 2.1.3, PyTorch 2.11.0+cu128, rasterio 1.5.1. The point of
+# recording it is that these numbers drift, so nothing here should depend on them.
 
 # --- Numerical / geospatial ---------------------------------------------------
 rasterio>=1.4

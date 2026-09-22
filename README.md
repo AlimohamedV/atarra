@@ -111,19 +111,40 @@ atarra train data/dataset --bands 8 --epochs 40
 
 ### Training (on Google Colab)
 
-Training needs a GPU and several gigabytes of imagery, so it belongs on Colab rather than here: this machine has a **4.29 GB** RTX 2050 and had under 3 GB of free disk, while a full Burullus 8-band composite at 10 m is 644 MB *per date*. Colab's runtime is Python **3.12** with numpy **2.0.2** and PyTorch **2.11**; both packaging constraints that would have blocked it (`requires-python < 3.12`, `numpy < 2`) are now scoped to where they actually apply.
+Training needs a GPU and several gigabytes of imagery, so it belongs on Colab rather than here: this machine has a **4.29 GB** RTX 2050 and had under 3 GB of free disk, while a full Burullus 8-band composite at 10 m is 644 MB *per date*. Colab's T4 runtime is Python **3.13.15** with numpy **2.1.3** and PyTorch **2.11.0+cu128** (measured on a live session, 2026-09-22); both packaging constraints that would have blocked it (`requires-python < 3.12`, `numpy < 2`) are now scoped to where they actually apply.
 
 `notebooks/atarra_colab_train.ipynb` drives it in **stages**, and the split is deliberate — free-tier sessions disconnect when idle, so a fetch combined with a training run means one disconnect discards both.
 
 | Stage | What runs | How often |
 |---|---|---|
-| Build | `atarra dataset build burullus --gsd 20 --stride 128 --dates 12 --out <drive>/store_20m` | once, 30–60 min |
+| Build | `atarra dataset build burullus --gsd 20 --stride 128 --dates 12 --out <drive>/store_20m` | once, **12.6 min measured** |
 | Reserve | `atarra annotation export <store> --out <drive>/annotation_pack --strategy reed` | once, **before any training** |
 | Pilot | `atarra train <store> --epochs 4 --exclude-pack <pack>` | first, to check the split |
-| Train | `atarra train <store> --bands 8 --epochs 40 --exclude-pack <pack>` | repeatedly, minutes |
+| Train | `atarra train <store> --bands 8 --epochs 40 --exclude-pack <pack>` | repeatedly, **20 min measured** |
 | Score | `atarra annotation score <pack> --checkpoint <run>/best.pt` | once labelled |
 
 Reserving before training is the load-bearing order: a test set the model has already seen is not a test set, and `--exclude-pack` removes the pack's **ground** — the same reed bed on every date it was imaged, plus its neighbours within half a tile — rather than only the tile keys it names.
+
+**Measured end to end on a free-tier T4 (2026-09-22)**, 12 dates at 20 m over Burullus: the store is 4.3 GB on disk and 3,096 tiles, split 1,692 train / 312 val / 468 test after 624 boundary tiles were dropped and 180 taken by the holdout. A store date costs ~63 s to build and 357.8 MB; an epoch costs 4 s at 244 tiles and 29 s at 1,692.
+
+These figures were produced by the weak-supervision rules as they stood on 2026-09-22, before the
+sediment-laden-water fix described under *The labels measure agreement, not truth*. The checkpoint
+itself was never copied off the Colab VM and no longer exists, so they cannot be re-derived from a
+file in this repository — only by re-running the job.
+
+| arm | test mIoU | phragmites IoU | phragmites F1 | pixel accuracy |
+|---|---|---|---|---|
+| 8-band multispectral | **0.864** | **0.958** | **0.979** | 0.990 |
+| 3-band RGB control | 0.665 | 0.677 | 0.807 | 0.934 |
+
+and the same two arms cut from the 2-date store, where the test split holds only 2,768 reed pixels:
+
+| arm | test mIoU | phragmites IoU | pixel accuracy |
+|---|---|---|---|
+| 8-band multispectral | 0.659 | 0.618 | 0.983 |
+| 3-band RGB control | 0.367 | **0.003** | 0.618 |
+
+Read the second table before quoting the first. At two dates the RGB arm's phragmites IoU of 0.003 means it never learned the class at all; at twelve it reaches 0.677 from the same bands. So "how much do the four extra bands buy" is **scale-dependent in magnitude** — 0.28 IoU at twelve dates, near-total at two — and the honest claim is that 8-band beats RGB at both scales, not that it buys a fixed number of points.
 
 The store build itself is **not** resumable: an interrupted build restarts, and an incomplete store (manifest present, shards missing) is detected and discarded rather than built on. Neither is a training run — there is no checkpoint-resume path — which is exactly why the store exists as a separate stage. Run directories are timestamped and `atarra train` refuses to write into one that already holds a run, because two 40-epoch runs whose `metrics.json` overwrote each other are indistinguishable afterwards.
 
@@ -140,10 +161,13 @@ Store builds are refused outright rather than warned about when the grid was coa
 
 Training labels come from the weak-supervision rule engine in `datasets/weak_labels.py`, so a metric computed against them scores **agreement with that rule engine** — if the rules are wrong about a pixel, a model that reproduces them faithfully is still scored correct. Every `metrics.json` carries that caveat as a field, so the number cannot be quoted without it.
 
-Two related decisions were bugs first, and are worth stating:
+Three related decisions were bugs first, and are worth stating:
 
 - The rule engine records every pixel it declined to be confident about. That mask is persisted alongside the tiles and *is* the annotation worklist: `TileStoreDataset.annotation_tiles()` ranks tiles by how much a human is needed and returns lon/lat corners for each, so the hardest cases open directly in QGIS. A handful of annotated tiles, held out, is what makes a defensible mIoU possible.
-- The loss mask is deliberately **not** the review mask. `REVIEW_THRESHOLD` is tuned for queue size, and the per-class scores saturate at different ceilings by design — the crop rule tops out at 0.597 against a 0.60 cut. Reusing it as a training filter deleted the **entire cropland class** by 0.003 of confidence, silently turning a 4-class problem into a 2-class one. Ambiguity is decided on **margin** instead (0.067 for a reed/crop coin flip, versus 0.23–0.52 for real decisions), and `test_every_class_survives_confidence_filtering` exists to keep it that way.
+- The loss mask is deliberately **not** the review mask. `REVIEW_THRESHOLD` is tuned for queue size, and the per-class scores saturate at different ceilings by design — the crop rule tops out at 0.597 against a 0.60 cut.  Reusing it as a training filter deleted the **entire cropland class** by 0.003 of confidence, silently turning a 4-class problem into a 2-class one. Ambiguity is decided on **margin** instead (0.067 for a reed/crop coin flip, versus 0.23–0.52 for real decisions), and `test_every_class_survives_confidence_filtering` exists to keep it that way.
+- **Sediment-laden water was invisible to the water rule, while the crop rule claimed it.** The water score rested on NDWI, and over turbid shallow water NIR comes back at **0.94×** green — measured over a real Burullus water body, NDWI lands at **+0.03**, so the wetness term contributed nothing exactly where the class matters most. At the same time `_crops_score` paid a flat 0.30 for the *absence* of a red edge, which is not evidence of cropland: water, shadow and cloud all lack one. The two scores tied at 0.35 against 0.30 — inside the 0.08 ambiguity margin — so the engine dropped the lagoon from the loss entirely. Two changes fix it: a flat-or-falling NDRE is admitted as water evidence (deliberately the weakest of three terms, because an absence never proves water on its own), and the crop rule's red-edge term now only amplifies evidence that is independently present. On the 273-tile Burullus store that recovered **2,431,960 px** of supervised ground (**+24.8 %**), took held-out water ground from 22,167 px to **811,600 px**, and left the reed class at exactly 415,905 px either way. `test_sediment_laden_water_reaches_the_loss` pins it, with a negative control that reinstates the superseded scorers and asserts the ground is dropped again.
+
+Because labels are written into the tile shards, this change does **not** relabel an existing store — a store must be rebuilt for it to take effect, and any checkpoint trained on the old labels describes a label set the current code no longer produces.
 
 #### Building a test set a panel will accept
 
@@ -239,7 +263,7 @@ These are the decisions that quietly determine whether reported metrics hold up.
 8. **Checkpoints carry provenance, not just weights.** Ordered band names (a channel *count* cannot tell B08 from B04 — the shape matches and every number is plausible) and the tile keys of every split. That is what lets `annotation score` check that annotated ground was never trained on, and report independence as **unverified** rather than assumed when the record is absent.
 9. **No target verdict is published for an unearned comparison.** `metrics.json` from a training run writes `targets.assessable: false` with the reason, because those metrics score the model against the rule engine that produced its labels. `score.json` does the same whenever its assessment is rejected. `both_met` is `null`, not `false`: the comparison was not made, and a boolean either way reads as an answer.
 10. **SCL masking happens before index computation.** Cloud, shadow, cirrus and snow otherwise enter the phenology features as spurious signal.
-11. **`numpy < 2` is pinned locally, and only locally.** The development machine's CUDA PyTorch build is compiled against numpy 1.26.4, so `requirements.txt` caps it. That is a property of one machine, not of ATARRA: `pyproject.toml` declares no upper bound and `requirements-colab.txt` leaves numpy alone, because Colab ships 2.0.2 alongside a numpy-2-native torch and forcing the downgrade there would churn its preinstalled pandas/scipy for no reason.
+11. **`numpy < 2` is pinned locally, and only locally.** The development machine's CUDA PyTorch build is compiled against numpy 1.26.4, so `requirements.txt` caps it. That is a property of one machine, not of ATARRA: `pyproject.toml` declares no upper bound and `requirements-colab.txt` leaves numpy alone, because Colab ships numpy 2.x alongside a numpy-2-native torch and forcing the downgrade there would churn its preinstalled pandas/scipy for no reason.
 12. **The disk cache has a hard byte ceiling** with LRU eviction, reporting its size on every write.
 13. **Loss weights are computed from the training split alone.** Reed is ~1.8 % of pixels on real Burullus imagery, so unweighted cross-entropy is minimised by predicting "not reed" everywhere. The inverse-frequency correction is necessary — but computing it over the whole store imports the validation and test class balance into a training-time decision.
 14. **Biomass is a proxy, not a measurement.** Canopy biomass cannot be observed directly from orbit; the harvest-window logic integrates NDVI/NDRE over the season as a documented proxy. Stated plainly rather than presented as ground truth.
@@ -250,8 +274,9 @@ These are the decisions that quietly determine whether reported metrics hold up.
 ## Known limitations
 
 - **No field validation yet.** Labels are bootstrapped by weak supervision and need a verification pass before reported accuracy means anything.
-- **The Colab notebook has never run on Colab.** Every cell has been executed locally against a synthetic store with the Drive paths redirected, which checks the logic and the printed claims but not the runtime, the Drive mount, or the download.
-- **No model has been trained to convergence, and no real-data training run has been scored.** The offline suite trains for one or two epochs on a 48 px synthetic store to prove the plumbing; `data/checkpoints/` is still empty. Nothing here is evidence about accuracy.
+- **The notebook in this repo has still never been executed on Colab.** On 2026-09-22 the pipeline was driven on a live T4 from a scratch notebook, using the same CLI commands in the same order (`dataset build` → `annotation export` → `train` × 2 arms), which exercises the runtime, the install, the GPU and the download. The Drive mount and the notebook's own cell ordering remain unexercised, and a scratch session is not the same evidence as running the artefact.
+- **No model has been trained to convergence.** The 40-epoch runs record their best validation epoch, and for the 12-date 8-band arm that was the *last* one — it was still improving when training stopped, so 40 epochs is a budget rather than a converged setting. `data/checkpoints/` in this checkout is still empty; those runs live on a Colab VM that will be reclaimed.
+- **Every accuracy figure above is agreement with the weak-supervision rules, not field-verified detection.** The 12-date 8-band arm reaches 0.958 phragmites IoU against that teacher — past the proposal's 0.82 / 0.85 thresholds — and `metrics.json` still records `targets.assessable: false`, because a model that faithfully reproduces a possibly-wrong rule is scored correct by definition. That is the whole reason the annotation pack exists, and its 8 tiles are still unlabelled.
 - **The GPU CI job is unexercised.** The workflow for it exists, but no self-hosted runner has ever picked it up.
 - **`--strategy reed` biases the test set on purpose** toward the class the proposal quotes a number for. That makes the reed IoU measurable; it also means the set is not a representative sample of the area, and the two claims are not the same claim.
 - **Biomass is modelled, not measured** (see rule 14).
