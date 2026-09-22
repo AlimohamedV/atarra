@@ -222,6 +222,16 @@ class CompositeTileDataset:
             # Carried through so the annotation queue can be exported without
             # re-running the rule engine over every composite.
             "review": labelled["review"][rows, cols],
+            # Pixels the swath actually covered. Distinct from `mask != -1`, which
+            # also excludes ambiguous pixels: ranking an annotation queue needs the
+            # base rate, and without this the two cannot be told apart after the fact.
+            "usable": labelled["usable"][rows, cols],
+            # The rule engine's opinion *before* the loss mask discarded the ambiguous
+            # pixels. `mask` cannot stand in for this: an ambiguous pixel is -1 there,
+            # indistinguishable from nodata, and those are precisely the pixels an
+            # annotator is being asked to adjudicate. Showing them as blank would hide
+            # the guess they are supposed to correct.
+            "rule_labels": labelled["labels"][rows, cols],
             "key": record.key,
             "block": record.block,
         }

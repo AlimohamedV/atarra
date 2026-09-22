@@ -269,8 +269,114 @@ def cmd_train(args: argparse.Namespace) -> int:
         device=args.device,
         patience=args.patience,
         max_tiles=args.max_tiles,
+        exclude_pack=args.exclude_pack,
     )
     print("\n" + format_report(metrics))
+    return 0
+
+
+def cmd_annotation_export(args: argparse.Namespace) -> int:
+    """Export the highest-need tiles as georeferenced chips for labelling."""
+    from atarra.datasets.export import export_annotation_pack
+
+    pack = export_annotation_pack(
+        args.store,
+        args.out,
+        limit=args.limit,
+        min_score=args.min_score,
+        overwrite=args.overwrite,
+        strategy=args.strategy,
+        seed=args.seed,
+    )
+
+    print(f"annotation pack written to {args.out}")
+    print(f"  area           {pack['area']}")
+    print(f"  tiles reserved {len(pack['tiles'])}  (of {pack['total_candidates_available']} "
+          f"candidates under strategy {pack['strategy']!r})")
+    print(f"  gsd            {pack['gsd']:g} m")
+    print(f"  bands          {', '.join(pack['imagery_bands'])}")
+    print(f"  reed pixels    {pack['reed_px_total']:,} across the pack")
+    if not pack["reed_px_sufficient"]:
+        print("                 WARNING: too few to measure a reed IoU -- the per-class")
+        print("                 score would not mean anything. Raise --limit, or select")
+        print("                 with --strategy reed.")
+    print()
+    print("  tiles, best first under the chosen strategy:")
+    for tile in pack["tiles"][:5]:
+        print(f"    {tile['rank']:>2}. {tile['key']:<16} {tile['date']}  "
+              f"score {tile['score']:>7.4f}  review {tile['review_fraction'] * 100:5.1f}%  "
+              f"reed {tile['reed_px']:>5} px")
+    if len(pack["tiles"]) > 5:
+        print(f"    ... {len(pack['tiles']) - 5} more, see annotation.geojson")
+
+    print()
+    print("next steps")
+    print("  1. open the chips in QGIS and draw polygons; save to labels/<key>.geojson")
+    print("     with an integer class_code field (codes are in the pack README)")
+    print(f"  2. retrain WITHOUT these tiles:  atarra train {args.store} --exclude-pack {args.out}")
+    print(f"  3. score against your labels:    atarra annotation score {args.out} "
+          "--checkpoint <run>/best.pt")
+    return 0
+
+
+def cmd_annotation_score(args: argparse.Namespace) -> int:
+    """Score a trained model against the human labels in a pack."""
+    from atarra.datasets.export import score_annotation_pack
+
+    result = score_annotation_pack(
+        args.pack, args.checkpoint, device=args.device, write=not args.no_write
+    )
+    report = result["report"]
+
+    print(f"scored {result['tiles_annotated']} annotated tile(s) of "
+          f"{result['tiles_reserved']} reserved")
+    print(f"  checkpoint     {result['checkpoint']}")
+    print(f"  bands          {result['bands']}")
+    print()
+    print("independent report (against human labels, not the rule engine)")
+    print(f"  mean IoU       {report['mean_iou']}")
+    print(f"  reed IoU       {report['phragmites_iou']}")
+    print(f"  reed F1        {report['phragmites_f1']}")
+    print(f"  pixel acc.     {report['pixel_accuracy']}")
+    print()
+    print("per class (IoU / F1 / support px)")
+    for entry in report["per_class"]:
+        print(f"  {entry['class_name']:<24} {entry['iou']} / {entry['f1']} / "
+              f"{entry['support_px']}")
+
+    if result["per_tile"]:
+        print()
+        print("per tile")
+        for entry in result["per_tile"]:
+            print(f"  {entry['key']:<18} agreement {entry['agreement']:.3f}  "
+                  f"labelled {entry['labelled_px']:,} px")
+
+    assessment = result["assessment"]
+    print()
+    if result["assessable"]:
+        targets = result["targets"]
+        print(f"proposal targets (reed IoU >= {targets['target_iou']}, "
+              f"F1 >= {targets['target_f1']}): "
+              f"{'met' if targets['both_met'] else 'not met'}")
+        print()
+        print(assessment["verdict"])
+    else:
+        # Deliberately does not print a target verdict. A single-class annotation can
+        # produce a perfect IoU from a model that predicts one class everywhere, and
+        # reporting that as "met" is the most misleading thing this tool could do.
+        print("targets        NOT ASSESSED -- this score is not a validation")
+        print()
+        print(f"  classes present  {', '.join(assessment['classes_present']) or 'none'}")
+        print(f"  reed annotated   {assessment['reed_support_px']:,} px "
+              f"(needs {assessment['min_reed_pixels']:,})")
+        print(f"  model predicted  {assessment['predicted_classes']}")
+        print()
+        print(assessment["verdict"])
+
+    if result["tiles_still_unlabelled"]:
+        print()
+        print(f"  {len(result['tiles_still_unlabelled'])} reserved tile(s) still have no "
+              "labels; the score above covers the rest")
     return 0
 
 
@@ -334,8 +440,44 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--rebuild", action="store_true", help="replace an existing store")
     q.set_defaults(func=cmd_dataset_build)
 
+    p = sub.add_parser("annotation", help="export tiles for labelling, and score against them")
+    annotation_sub = p.add_subparsers(dest="annotation_command", required=True)
+    q = annotation_sub.add_parser("export", help="write georeferenced chips + a GeoJSON index")
+    q.add_argument("store", help="store directory built by `atarra dataset build`")
+    q.add_argument("--out", default="data/annotation", help="pack directory")
+    q.add_argument("--limit", type=int, default=20, help="how many tiles to reserve (default 20)")
+    q.add_argument(
+        "--strategy",
+        choices=["uncertainty", "reed", "random"],
+        default="uncertainty",
+        help="uncertainty = hardest ground (default), reed = tiles richest in the "
+        "target class, random = a representative sample",
+    )
+    q.add_argument(
+        "--min-score",
+        type=float,
+        default=0.0,
+        help="only export tiles at or above this score; units follow --strategy "
+        "(a review fraction, or a reed pixel count)",
+    )
+    q.add_argument("--seed", type=int, default=0, help="seed for --strategy random")
+    q.add_argument("--overwrite", action="store_true", help="replace an existing pack")
+    q.set_defaults(func=cmd_annotation_export)
+
+    q = annotation_sub.add_parser("score", help="score a checkpoint against human labels")
+    q.add_argument("pack", help="pack directory containing labels/")
+    q.add_argument("--checkpoint", required=True, help="path to best.pt from a training run")
+    q.add_argument("--device", default=None)
+    q.add_argument("--no-write", action="store_true", help="do not write score.json")
+    q.set_defaults(func=cmd_annotation_score)
+
     p = sub.add_parser("train", help="train a segmentation model from a tile store")
     p.add_argument("store", help="store directory built by `atarra dataset build`")
+    p.add_argument(
+        "--exclude-pack",
+        default=None,
+        help="annotation pack whose reserved tiles must not be trained on",
+    )
     p.add_argument(
         "--bands",
         choices=["8", "10", "rgb"],

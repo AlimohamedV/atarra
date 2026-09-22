@@ -24,7 +24,7 @@ from atarra.datasets.store import (
     load_manifest,
 )
 from atarra.datasets.tile_dataset import geometric_split
-from atarra.datasets.weak_labels import NUM_CLASSES
+from atarra.datasets.weak_labels import NUM_CLASSES, PHRAGMITES_CODE
 from atarra.pipeline import Composite
 from atarra.preprocess.indices import compute_indices
 
@@ -95,16 +95,16 @@ class TestReflectanceCodec:
 
 class TestBuildStore:
     def test_writes_a_manifest_that_matches_its_shards(
-        self, tmp_path, patch_composite, veg_water_stack, simple_grid
+        self, tmp_path, patch_composite, veg_water_stack, store_grid
     ):
-        patch_composite(_composite(veg_water_stack, simple_grid))
+        patch_composite(_composite(veg_water_stack, store_grid))
         manifest = build_store(
             tmp_path / "store",
             "test_area",
             [date(2024, 8, 20)],
             gsd=10.0,
             tile_size=64,
-            stride=32,
+            stride=64,
         )
 
         assert manifest["totals"]["shards"] == 1
@@ -131,9 +131,9 @@ class TestBuildStore:
         assert sum(manifest["totals"]["class_counts"]) <= manifest["totals"]["trainable_px"]
 
     def test_returns_tiles_that_can_be_read_back(
-        self, tmp_path, patch_composite, veg_water_stack, simple_grid
+        self, tmp_path, patch_composite, veg_water_stack, store_grid
     ):
-        composite = _composite(veg_water_stack, simple_grid)
+        composite = _composite(veg_water_stack, store_grid)
         patch_composite(composite)
         build_store(
             tmp_path / "store",
@@ -141,7 +141,7 @@ class TestBuildStore:
             [date(2024, 8, 20)],
             gsd=10.0,
             tile_size=64,
-            stride=32,
+            stride=64,
         )
 
         dataset = TileStoreDataset(tmp_path / "store")
@@ -155,10 +155,10 @@ class TestBuildStore:
         assert set(np.unique(item["mask"])) <= {-1, 0, 1, 2, 3}
 
     def test_stored_pixels_survive_the_round_trip(
-        self, tmp_path, patch_composite, synthetic_stack, simple_grid
+        self, tmp_path, patch_composite, synthetic_stack, store_grid
     ):
         """Values must match the composite, not merely be plausible."""
-        composite = _composite(synthetic_stack, simple_grid)
+        composite = _composite(synthetic_stack, store_grid)
         patch_composite(composite)
         build_store(
             tmp_path / "store",
@@ -174,7 +174,39 @@ class TestBuildStore:
         expected = synthetic_stack.band("B02")[:64, :64]
         assert np.allclose(item["image"][0], expected, atol=1e-4)
 
-    def test_refuses_to_mix_two_different_grids(self, tmp_path, patch_composite, veg_water_stack, simple_grid):
+    def test_tile_keys_are_unique_across_dates(
+        self, tmp_path, patch_composite, synthetic_stack, store_grid
+    ):
+        """Two dates must not share a tile key.
+
+        Regression test. `TileRecord.key` is `c{composite_index}/r{row}_c{col}`, and
+        each date is tiled as its own single-composite dataset, so the index is always
+        0. Every date therefore produced the same keys: an exported chip set would
+        overwrite itself, a held-out key would reserve that position on every date, and
+        an annotator's `labels/<key>.geojson` would be shared between two different
+        dates. A single-date store hides all of it.
+        """
+        composite = _composite(synthetic_stack, store_grid)
+        patch_composite(composite)
+        build_store(
+            tmp_path / "store",
+            "test_area",
+            [date(2024, 8, 20), date(2024, 8, 25)],
+            gsd=10.0,
+            tile_size=64,
+            stride=64,
+        )
+
+        dataset = TileStoreDataset(tmp_path / "store")
+        keys = [record.key for record in dataset.records]
+        assert len(dataset.manifest["shards"]) == 2, "two dates must give two shards"
+        assert len(set(keys)) == len(keys), (
+            f"{len(keys) - len(set(keys))} tile key(s) collide across dates"
+        )
+        # And the collision must be visible in the key, not merely absent by luck.
+        assert len({key.split("/")[0] for key in keys}) == 2
+
+    def test_refuses_to_mix_two_different_grids(self, tmp_path, patch_composite, veg_water_stack, store_grid):
         """Blocks are only comparable across shards if the grid is shared.
 
         Otherwise the same block key means different ground in different shards and
@@ -183,9 +215,9 @@ class TestBuildStore:
         other = grid_from_bbox(
             BBox.from_sequence([30.80, 31.45, 30.83, 31.48]), "EPSG:32636", 10.0
         )
-        assert (other.width, other.height) != (simple_grid.width, simple_grid.height)
+        assert (other.width, other.height) != (store_grid.width, store_grid.height)
         patch_composite(
-            _composite(veg_water_stack, simple_grid),
+            _composite(veg_water_stack, store_grid),
             _composite(veg_water_stack, other),
         )
         with pytest.raises(AtarraError, match="share one grid"):
@@ -195,17 +227,17 @@ class TestBuildStore:
                 [date(2024, 8, 20), date(2024, 8, 25)],
                 gsd=10.0,
                 tile_size=64,
-                stride=32,
+                stride=64,
             )
 
-    def test_refuses_a_grid_that_was_coarsened_to_fit(self, tmp_path, patch_composite, veg_water_stack, simple_grid):
+    def test_refuses_a_grid_that_was_coarsened_to_fit(self, tmp_path, patch_composite, veg_water_stack, store_grid):
         """A coarsened grid would make the manifest lie about the stored scale.
 
         ``choose_grid`` doubles the resolution until the AOI fits ``max_size``. If
         that happens, tiles are stored at (say) 40 m while the manifest claims 10 m,
         and the model trains at the wrong scale with no error anywhere.
         """
-        coarse = grid_from_bbox(simple_grid.bounds, "EPSG:32636", 40.0)
+        coarse = grid_from_bbox(store_grid.bounds, "EPSG:32636", 40.0)
         patch_composite(_composite(veg_water_stack, coarse))
         with pytest.raises(AtarraError, match="Grid was coarsened"):
             build_store(
@@ -214,13 +246,13 @@ class TestBuildStore:
                 [date(2024, 8, 20)],
                 gsd=10.0,
                 tile_size=64,
-                stride=32,
+                stride=64,
             )
 
     def test_an_existing_store_is_not_silently_appended_to(
-        self, tmp_path, patch_composite, veg_water_stack, simple_grid
+        self, tmp_path, patch_composite, veg_water_stack, store_grid
     ):
-        patch_composite(_composite(veg_water_stack, simple_grid))
+        patch_composite(_composite(veg_water_stack, store_grid))
         for rebuild in (False, True):
             build_store(
                 tmp_path / "store",
@@ -228,7 +260,7 @@ class TestBuildStore:
                 [date(2024, 8, 20)],
                 gsd=10.0,
                 tile_size=64,
-                stride=32,
+                stride=64,
                 first=rebuild,
             )
 
@@ -239,16 +271,16 @@ class TestBuildStore:
                 [date(2024, 8, 20)],
                 gsd=10.0,
                 tile_size=64,
-                stride=32,
+                stride=64,
             )
 
     def test_a_date_that_cannot_be_fetched_is_recorded_not_fatal(
-        self, tmp_path, monkeypatch, veg_water_stack, simple_grid
+        self, tmp_path, monkeypatch, veg_water_stack, store_grid
     ):
         """One cloudy overpass must not throw away the dates that did work."""
         import atarra.pipeline as pipeline_module
 
-        good = _composite(veg_water_stack, simple_grid)
+        good = _composite(veg_water_stack, store_grid)
         calls = {"n": 0}
 
         def flaky(area_key, target_date, **kwargs):
@@ -264,7 +296,7 @@ class TestBuildStore:
             [date(2024, 8, 18), date(2024, 8, 20)],
             gsd=10.0,
             tile_size=64,
-            stride=32,
+            stride=64,
         )
 
         assert len(manifest["shards"]) == 1
@@ -287,21 +319,21 @@ class TestBuildStore:
                 [date(2024, 8, 20)],
                 gsd=10.0,
                 tile_size=64,
-                stride=32,
+                stride=64,
             )
 
 
 class TestStoreDataset:
     @pytest.fixture
-    def store(self, tmp_path, patch_composite, veg_water_stack, simple_grid):
-        patch_composite(_composite(veg_water_stack, simple_grid))
+    def store(self, tmp_path, patch_composite, veg_water_stack, store_grid):
+        patch_composite(_composite(veg_water_stack, store_grid))
         build_store(
             tmp_path / "store",
             "test_area",
             [date(2024, 8, 20)],
             gsd=10.0,
             tile_size=64,
-            stride=32,
+            stride=64,
         )
         return tmp_path / "store"
 
@@ -403,24 +435,26 @@ class TestStoreDataset:
         assert 0.001 < (max(lons) - min(lons)) < 0.02
 
     def test_annotation_worklist_is_ranked_by_need(
-        self, tmp_path, patch_composite, synthetic_stack, simple_grid
+        self, tmp_path, patch_composite, synthetic_stack, store_grid
     ):
         """Effort must go where the rules are unsure, not where they are confident."""
-        patch_composite(_composite(synthetic_stack, simple_grid))
+        patch_composite(_composite(synthetic_stack, store_grid))
         build_store(
             tmp_path / "noisy",
             "test_area",
             [date(2024, 8, 20)],
             gsd=10.0,
             tile_size=64,
-            stride=32,
+            stride=64,
         )
         dataset = TileStoreDataset(tmp_path / "noisy")
         worklist = dataset.annotation_tiles(limit=5)
 
         assert worklist, "random spectra must leave pixels the rules cannot call"
-        fractions = [item["review_fraction"] for item in worklist]
-        assert fractions == sorted(fractions, reverse=True), "highest need first"
+        scores = [item["score"] for item in worklist]
+        assert scores == sorted(scores, reverse=True), "highest need first"
+        assert all(0.0 < score <= 1.0 for score in scores), "a review fraction"
+        assert all(item["reed_px"] >= 0 for item in worklist)
         assert all(len(item["corners_wgs84"]) == 4 for item in worklist)
         assert all(item["date"] == "2024-08-20" for item in worklist)
 
@@ -437,6 +471,166 @@ class TestStoreDataset:
         assert len(dataset) > 0
         assert dataset[0]["image"].shape[0] == 8
         assert dataset.review_at(0) is None
+
+    def test_ranking_measures_uncertainty_not_empty_swath(
+        self, tmp_path, monkeypatch, store_grid, stack_builder
+    ):
+        """Review density must be relative to usable ground, not to the frame.
+
+        Regression test for a real defect. Sentinel-2 tiles are rotated diamonds, so a
+        tile's bounding box can be 70%+ empty. Counting empty ground as "needs review"
+        (which ``review |= ~usable`` did) turns density into a measure of how *empty* a
+        tile is, and the ranking then hands an annotator the emptiest tiles in the store
+        instead of the most uncertain ones.
+
+        The fixture is built so the two metrics disagree sharply: one date is fully
+        covered and genuinely ambiguous, the other is 90% empty swath whose covered
+        ground the rules call confidently. Frame-relative scoring prefers the empty one.
+        """
+        from datetime import date as Date
+
+        import atarra.pipeline as pipeline_module
+        from atarra.preprocess.reader import BandStack
+
+        # Fully covered, and spectrally mixed enough that the rules abstain.
+        ambiguous = _composite(
+            stack_builder(
+                store_grid,
+                ["B02", "B03", "B04", "B05", "B08", "B8A", "B11", "B12"],
+                seed=3,
+            ),
+            store_grid,
+            Date(2024, 8, 20),
+        )
+
+        # 90% empty swath, but what is covered is confidently labelled.
+        #
+        # Built here rather than by invalidating `veg_water_stack`, which is created on
+        # the standard test grid: a stack whose shape disagrees with the composite's grid
+        # tiles to nothing, so the fixture would be silently empty and this test would
+        # pass while asserting nothing.
+        from rasterio.windows import Window
+
+        height, width = store_grid.height, store_grid.width
+        half = width // 2
+        # Left half open water (dark NIR), right half dense vegetation (bright NIR).
+        water = [0.06, 0.05, 0.04, 0.035, 0.025, 0.025, 0.04, 0.04]
+        vegetation = [0.06, 0.08, 0.04, 0.18, 0.42, 0.42, 0.20, 0.20]
+        data = np.zeros((8, height, width), dtype=np.float32)
+        for channel in range(8):
+            data[channel, :, :half] = water[channel]
+            data[channel, :, half:] = vegetation[channel]
+
+        valid = np.ones((height, width), dtype=bool)
+        cutoff = int(height * 0.9)
+        valid[:cutoff, :] = False
+        data[:, :cutoff, :] = np.nan
+        partial = BandStack(
+            data=data,
+            valid=valid,
+            grid=store_grid,
+            band_names=["B02", "B03", "B04", "B05", "B08", "B8A", "B11", "B12"],
+            window=Window(0, 0, width, height),
+            scene_ids=["synthetic"],
+        )
+        mostly_empty = _composite(partial, store_grid, Date(2024, 8, 25))
+
+        by_date = {ambiguous.target_date: ambiguous, mostly_empty.target_date: mostly_empty}
+        monkeypatch.setattr(
+            pipeline_module, "load_composite", lambda area, when, **kwargs: by_date[when]
+        )
+        build_store(
+            tmp_path / "store",
+            "test_area",
+            sorted(by_date),
+            gsd=10.0,
+            tile_size=64,
+            stride=64,
+        )
+
+        dataset = TileStoreDataset(tmp_path / "store")
+        by_key = {record.key: index for index, record in enumerate(dataset.records)}
+
+        empty_keys = {
+            record.key
+            for index, record in enumerate(dataset.records)
+            if float(dataset.usable_at(index).mean()) < 0.5
+        }
+        assert empty_keys, "the fixture must contain a mostly-empty date"
+        assert len(empty_keys) < len(dataset.records), "and a fully covered one"
+
+        # The tiles that actually discriminate are the *partially* covered ones: a tile
+        # wholly inside the empty band scores the same either way. Without this the test
+        # could pass while never exercising the bug.
+        partially_covered = [key for key in empty_keys if dataset.usable_at(by_key[key]).any()]
+        assert partially_covered, "the fixture must produce partly covered tiles"
+
+        for key in empty_keys:
+            index = by_key[key]
+            review = dataset.review_at(index)
+            usable = dataset.usable_at(index)
+            assert usable.mean() <= 0.15, "these tiles are mostly empty swath"
+            # What the buggy metric measured: empty ground promoted to "needs review".
+            assert float(np.where(usable, review, True).mean()) > 0.85
+            if usable.any():
+                # What the fixed metric measures: nothing here needs a human.
+                assert float(review[usable].mean()) == 0.0
+
+        ranking = dataset.annotation_ranking()
+        ranked_keys = {dataset.records[index].key for _, index in ranking}
+        assert ranked_keys.isdisjoint(empty_keys), (
+            "tiles that are mostly empty swath outranked genuinely uncertain ground"
+        )
+        assert dataset.records[ranking[0][1]].key not in empty_keys
+
+    def test_reed_strategy_prefers_tiles_containing_the_target_class(
+        self, store
+    ):
+        """A test set needs enough of the class it measures.
+
+        Reed is ~1.8% of this imagery, so a selection made without regard to reed
+        content can leave too few reed pixels for the per-class IoU to mean anything --
+        one run of this project reported "reed IoU 0.0" from 36 support pixels.
+        """
+        dataset = TileStoreDataset(store)
+        ranking = dataset.annotation_ranking(strategy="reed")
+        for score, index in ranking:
+            assert score == float((dataset.label_at(index) == PHRAGMITES_CODE).sum())
+            assert score > 0
+        if len(ranking) > 1:
+            assert ranking[0][0] >= ranking[-1][0], "richest in reed first"
+
+    def test_random_strategy_is_seeded_and_covers_every_tile(self, store):
+        dataset = TileStoreDataset(store)
+        first = dataset.annotation_ranking(strategy="random")
+        again = dataset.annotation_ranking(strategy="random")
+        assert [index for _, index in first] == [index for _, index in again], (
+            "an unseeded sample would make two packs incomparable"
+        )
+        assert sorted(index for _, index in first) == list(range(len(dataset)))
+
+    def test_an_unknown_strategy_is_refused(self, store):
+        with pytest.raises(AtarraError, match="unknown annotation strategy"):
+            TileStoreDataset(store).annotation_ranking(strategy="vibes")
+
+    def test_ranking_raises_clearly_for_a_store_without_the_validity_mask(self, store):
+        """Silently falling back would produce a confident, wrong ranking."""
+        import os
+
+        # Delete before opening: the dataset memory-maps these files, and Windows
+        # refuses to unlink a file that still has an open mapping.
+        manifest = load_manifest(store)
+        for entry in manifest["shards"]:
+            path = store / "shards" / entry["date"] / "valid.npy"
+            if path.exists():
+                os.remove(path)
+
+        without = TileStoreDataset(store)
+        assert without.usable_at(0) is None
+        with pytest.raises(AtarraError, match="predates the validity mask"):
+            without.annotation_ranking()
+        # ...but it must still be usable for training.
+        assert len(without) > 0
 
     def test_a_directory_without_a_manifest_is_reported_clearly(self, tmp_path):
         with pytest.raises(AtarraError, match="not a tile store"):

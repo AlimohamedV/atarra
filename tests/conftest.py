@@ -26,6 +26,21 @@ def simple_grid(simple_bbox: BBox) -> Grid:
     return grid_from_bbox(simple_bbox, "EPSG:32636", 10.0)
 
 
+@pytest.fixture
+def store_grid() -> Grid:
+    """A deliberately tiny AOI for tests that write real files.
+
+    Store and annotation-pack tests write .npy shards and GeoTIFFs to disk. On the
+    standard test grid (487x565) each store is ~17 MB, which across a full run is most
+    of a gigabyte of temporary files -- enough to fill a small disk, and a full disk
+    turns a real assertion failure into an unrelated write error that reads like a bug
+    in the code under test. This grid is ~240x280 and keeps a run in the tens of MB.
+    """
+    return grid_from_bbox(
+        BBox.from_sequence([30.80, 31.45, 30.825, 31.475]), "EPSG:32636", 10.0
+    )
+
+
 def make_stack(
     grid: Grid,
     band_names: list[str],

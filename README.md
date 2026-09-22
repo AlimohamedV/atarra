@@ -138,6 +138,46 @@ Two related decisions were bugs first, and are worth stating:
 - The rule engine records every pixel it declined to be confident about. That mask is persisted alongside the tiles and *is* the annotation worklist: `TileStoreDataset.annotation_tiles()` ranks tiles by how much a human is needed and returns lon/lat corners for each, so the hardest cases open directly in QGIS. A handful of annotated tiles, held out, is what makes a defensible mIoU possible.
 - The loss mask is deliberately **not** the review mask. `REVIEW_THRESHOLD` is tuned for queue size, and the per-class scores saturate at different ceilings by design — the crop rule tops out at 0.597 against a 0.60 cut. Reusing it as a training filter deleted the **entire cropland class** by 0.003 of confidence, silently turning a 4-class problem into a 2-class one. Ambiguity is decided on **margin** instead (0.067 for a reed/crop coin flip, versus 0.23–0.52 for real decisions), and `test_every_class_survives_confidence_filtering` exists to keep it that way.
 
+#### Building a test set a panel will accept
+
+The rule engine already knows which pixels it cannot call, so annotating its uncertainty is cheaper than annotating at random:
+
+```bash
+atarra annotation export data/dataset --out data/annotation --limit 20 --strategy reed
+atarra train data/dataset --exclude-pack data/annotation     # the reserved tiles stay unseen
+atarra annotation score data/annotation --checkpoint data/checkpoints/<run>/best.pt
+```
+
+The export writes three georeferenced GeoTIFFs per tile — the imagery, the rule engine's current guess (so you **correct** it rather than start from blank), and a review mask showing where that guess is untrustworthy — plus `annotation.geojson` with one polygon per tile carrying its lon/lat corners, and a generated README.
+
+`--strategy` decides what "top-ranked" means, and the choice matters:
+
+| Strategy | Picks | Use it for |
+|---|---|---|
+| `uncertainty` (default) | ground where the rules are least confident | improving the *training* labels |
+| `reed` | tiles richest in the target class | a test set that can actually measure reed IoU |
+| `random` | a seeded sample | a representative, non-adversarial test set |
+
+The default is a **hard-case** selection, so a test set built from it measures the model on the hardest pixels in the area. That is defensible, but it is not a representative sample, and it is why `reed` exists: reed is ~1.8 % of this imagery, and one arbitrary selection produced "reed IoU 0.0" from **36 support pixels**, which measures nothing.
+
+Labels can be polygons (`labels/<key>.geojson` with an integer `class_code` field — draw them in QGIS, which is what it is good at) or a raster on the chip's grid. Polygon geometry is reprojected from WGS84 into the chip's CRS before rasterising; GeoJSON is WGS84 by specification, and rasterising lon/lat against a UTM transform does not fail, it silently produces garbage.
+
+##### The scorer refuses to flatter you
+
+A metric can be arithmetically perfect and completely empty. Measured during development: a model trained for 2 epochs on 7 tiles reported **reed IoU 1.0, "proposal targets met"** — because the annotation covered a single class, and a model predicting that class everywhere scores 1.0 on every pixel of it.
+
+So `score.json` carries an `assessable` flag with the blocking reason, and the CLI will not print a target verdict when the score is not a validation:
+
+```
+targets        NOT ASSESSED -- this score is not a validation
+  classes present  phragmites_australis
+  reed annotated   32,768 px (needs 500)
+  model predicted  [3]
+NOT A VALIDATION of the model: the annotations cover only 1 class(es)...
+```
+
+Three ways a report is rejected as a validation: fewer than two classes annotated, fewer than 500 reed pixels annotated, or the model predicting a single class across every annotated pixel. Scorer and scores both stop at "not assessable" rather than "passed".
+
 ### Tests
 
 ```bash

@@ -215,8 +215,13 @@ def weak_label(
     else:
         usable = finite
 
-    # `review` is the annotation worklist: every pixel a human should adjudicate.
-    review = ~confident | halophyte | ~usable
+    # `review` is the annotation worklist: pixels that carry a label and that a human
+    # should adjudicate. Restricted to usable pixels on purpose. Nodata is not a
+    # question for a human, it is simply absent -- and counting it as review made the
+    # review *density* of a tile measure how much of its bounding box falls outside the
+    # rotated Sentinel-2 swath (70%+ is typical). Ranking by that selects the emptiest
+    # tiles instead of the most uncertain ones, which is the opposite of the intent.
+    review = (~confident | halophyte) & usable
 
     # `trainable` is the loss mask, and it is deliberately NOT the same mask.
     #
@@ -279,7 +284,9 @@ def label_statistics(result: dict, *, class_names: list[str] | None = None) -> d
         "dropped_px": total - trainable_px,
         "dropped_fraction": round((total - trainable_px) / max(1, total), 5),
         "review_px": review_px,
-        "review_fraction": round(review_px / max(1, labels.size), 5),
+        # Over usable pixels, not over the frame: the frame includes the swath's empty
+        # corners, which would make this ratio a measure of tile geometry.
+        "review_fraction": round(review_px / max(1, total), 5),
         "mean_confidence": round(float(result["confidence"][usable].mean()), 4),
         "classes": classes,
     }

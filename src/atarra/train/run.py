@@ -80,8 +80,14 @@ def train_from_store(
     patience: int = 10,
     fractions: tuple[float, float, float] = (0.70, 0.15, 0.15),
     max_tiles: int | None = None,
+    exclude_pack: Path | str | None = None,
 ) -> dict:
-    """Train a segmentation model on a tile store and write a metrics artifact."""
+    """Train a segmentation model on a tile store and write a metrics artifact.
+
+    ``exclude_pack`` names an annotation pack whose tiles must not be trained on. A
+    held-out set the model has already seen is not held out, so this removes them
+    before the split rather than hoping nobody notices.
+    """
     torch = _require_torch()
 
     from atarra.models.segmentation import build_model, count_parameters
@@ -94,7 +100,22 @@ def train_from_store(
         train,
     )
 
-    dataset = TileStoreDataset(store, band_names=bands, augment=augment, seed=seed)
+    holdout: set[str] = set()
+    if exclude_pack is not None:
+        from atarra.datasets.export import reserved_keys
+
+        holdout = reserved_keys(exclude_pack)
+        if not holdout:
+            raise AtarraError(
+                f"{exclude_pack} reserves no tiles, so there is nothing to exclude; "
+                "refusing to proceed silently, because a pack that reserves nothing "
+                "would make the held-out set meaningless"
+            )
+        log.info("excluding %d reserved tile(s) from %s", len(holdout), exclude_pack)
+
+    dataset = TileStoreDataset(
+        store, band_names=bands, augment=augment, seed=seed, holdout_keys=holdout
+    )
     if max_tiles and len(dataset) > max_tiles:
         # Deterministic truncation for smoke runs, not for real experiments.
         dataset.records = dataset.records[:max_tiles]
@@ -193,6 +214,15 @@ def train_from_store(
             "parameters": count_parameters(model),
         },
         "dataset": dataset.describe(),
+        "holdout": {
+            "pack": None if exclude_pack is None else str(exclude_pack),
+            "tiles_excluded": len(holdout),
+            "purpose": (
+                "these tiles are reserved for hand annotation, and scoring the model "
+                "against them is the only measure of detection accuracy the project "
+                "can honestly claim"
+            ),
+        },
         "band_statistics": stats,
         "splits": {
             "fractions": list(fractions),

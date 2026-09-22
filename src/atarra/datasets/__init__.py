@@ -21,6 +21,13 @@ from atarra.datasets.store import (
     encode_reflectance,
     load_manifest,
 )
+from atarra.datasets.export import (
+    export_annotation_pack,
+    load_annotations,
+    load_pack,
+    reserved_keys,
+    score_annotation_pack,
+)
 
 __all__ = [
     "CLASS_NAMES",
@@ -34,8 +41,13 @@ __all__ = [
     "class_weights_from_counts",
     "decode_reflectance",
     "encode_reflectance",
+    "export_annotation_pack",
     "geometric_split",
     "label_statistics",
+    "load_annotations",
     "load_manifest",
+    "load_pack",
+    "reserved_keys",
+    "score_annotation_pack",
     "weak_label",
 ]

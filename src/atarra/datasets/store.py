@@ -26,6 +26,7 @@ Shard layout::
     <root>/shards/<date>/blocks.npy  int32   [N, 2]      (spatial block per tile)
     <root>/shards/<date>/offsets.npy int32   [N, 2]      (row, col of tile in grid)
     <root>/shards/<date>/review.npy  uint8   [N, H, W]   (1 = needs a human)
+    <root>/shards/<date>/valid.npy   uint8   [N, H, W]   (1 = swath covered it)
     <root>/shards/<date>/keys.json   list[str]
 
 The review mask is persisted because it is the annotation worklist. It records the
@@ -56,7 +57,7 @@ import numpy as np
 
 from atarra.core.errors import AtarraError
 from atarra.core.logging import get_logger
-from atarra.datasets.weak_labels import NUM_CLASSES
+from atarra.datasets.weak_labels import NUM_CLASSES, PHRAGMITES_CODE
 
 log = get_logger("datasets.store")
 
@@ -121,6 +122,8 @@ def write_shard(
     num_classes: int,
     reviews: np.ndarray | None = None,
     offsets: np.ndarray | None = None,
+    usable: np.ndarray | None = None,
+    rule_labels: np.ndarray | None = None,
 ) -> dict:
     """Persist one date's tiles. Returns the manifest entry for the shard."""
     directory = _shard_dir(root, date)
@@ -134,6 +137,10 @@ def write_shard(
         np.save(directory / "review.npy", reviews.astype(np.uint8))
     if offsets is not None:
         np.save(directory / "offsets.npy", offsets.astype(np.int32))
+    if usable is not None:
+        np.save(directory / "valid.npy", usable.astype(np.uint8))
+    if rule_labels is not None:
+        np.save(directory / "rule.npy", rule_labels.astype(MASK_DTYPE))
 
     trainable = masks >= 0
     # `range` over a fixed class count rather than `masks.max()`: a shard whose tiles
@@ -147,6 +154,7 @@ def write_shard(
         "tiles": int(images.shape[0]),
         "class_counts": counts,
         "trainable_px": int(trainable.sum()),
+        "usable_px": int(usable.sum()) if usable is not None else None,
         "review_px": int(reviews.sum()) if reviews is not None else None,
     }
 
@@ -274,12 +282,20 @@ def build_store(
         images = np.stack([encode_reflectance(item["image"]) for item in items], axis=0)
         masks = np.stack([item["mask"].astype(MASK_DTYPE) for item in items], axis=0)
         reviews = np.stack([item["review"] for item in items], axis=0)
+        usable = np.stack([item["usable"] for item in items], axis=0)
+        rule_labels = np.stack([item["rule_labels"] for item in items], axis=0)
         blocks = np.array([tiled.records[i].block for i in range(len(tiled))], dtype=np.int32)
         offsets = np.array(
             [(tiled.records[i].row, tiled.records[i].col) for i in range(len(tiled))],
             dtype=np.int32,
         )
-        keys = [tiled.records[i].key for i in range(len(tiled))]
+        # The date is prefixed because `TileRecord.key` is `c{index}/r{row}_c{col}`,
+        # and `index` is the position of the composite within one build call -- always
+        # 0 here, since each date is tiled separately. Without the prefix every date
+        # would produce a tile called `c0/r0_c0`: twelve shards sharing keys, so an
+        # exported chip set would overwrite itself and a held-out key would silently
+        # reserve the same position on every date.
+        keys = [f"{day}/{tiled.records[i].key}" for i in range(len(tiled))]
 
         entry = write_shard(
             root,
@@ -291,6 +307,8 @@ def build_store(
             num_classes=NUM_CLASSES,
             reviews=reviews,
             offsets=offsets,
+            usable=usable,
+            rule_labels=rule_labels,
         )
         entry.update(
             {
@@ -310,7 +328,7 @@ def build_store(
         )
 
         # Release before the next date is fetched; this is the streaming guarantee.
-        del composite, tiled, items, images, masks, reviews
+        del composite, tiled, items, images, masks, reviews, usable, rule_labels
 
     if not manifest["shards"]:
         raise AtarraError(
@@ -329,9 +347,8 @@ def build_store(
         "shards": len(manifest["shards"]),
         "class_counts": merged.tolist(),
         "trainable_px": int(sum(s["trainable_px"] for s in manifest["shards"])),
-        "review_px": int(
-            sum(s["review_px"] or 0 for s in manifest["shards"])
-        ),
+        "usable_px": int(sum(s["usable_px"] or 0 for s in manifest["shards"])),
+        "review_px": int(sum(s["review_px"] or 0 for s in manifest["shards"])),
     }
 
     (root / "manifest.json").write_text(
@@ -379,11 +396,13 @@ class TileStoreDataset:
         band_names: Sequence[str] | None = None,
         augment: bool = False,
         seed: int = 0,
+        holdout_keys: Sequence[str] | None = None,
     ) -> None:
         self.root = Path(root)
         self.manifest = load_manifest(self.root)
         self.augment = augment
         self.seed = int(seed)
+        self.holdout_keys = frozenset(holdout_keys or ())
 
         stored = list(self.manifest["bands"])
         self.stored_bands = stored
@@ -411,10 +430,25 @@ class TileStoreDataset:
             reviews = np.load(review_path, mmap_mode="r") if review_path.exists() else None
             offset_path = directory / "offsets.npy"
             offsets = np.load(offset_path) if offset_path.exists() else None
+            valid_path = directory / "valid.npy"
+            valid = np.load(valid_path, mmap_mode="r") if valid_path.exists() else None
+            rule_path = directory / "rule.npy"
+            rules = np.load(rule_path, mmap_mode="r") if rule_path.exists() else None
             self._shards.append(
-                {"images": images, "masks": masks, "reviews": reviews, "date": entry["date"]}
+                {
+                    "images": images,
+                    "masks": masks,
+                    "reviews": reviews,
+                    "valid": valid,
+                    "rules": rules,
+                    "date": entry["date"],
+                }
             )
             for offset in range(images.shape[0]):
+                # Reserved tiles are dropped here rather than filtered later, so that
+                # every downstream index and split covers only what may be trained on.
+                if keys[offset] in self.holdout_keys:
+                    continue
                 self.records.append(
                     StoredTile(
                         shard=shard_index,
@@ -445,12 +479,33 @@ class TileStoreDataset:
 
             image, mask = augment_tile(image, mask, seed=self.seed, index=index)
 
-        return {
+        item = {
             "image": np.ascontiguousarray(image),
             "mask": np.ascontiguousarray(mask),
             "key": record.key,
             "block": record.block,
         }
+
+        if not self.augment:
+            # Annotation-support arrays, supplied only when nothing has been spatially
+            # transformed. `augment_tile` flips and rotates the image and mask, and these
+            # would stay put -- a desynced review mask would point an annotator at the
+            # wrong ground, which is worse than not having one.
+            valid = shard["valid"]
+            if valid is None:
+                raise AtarraError(
+                    f"tile {record.key} has no stored validity mask, so it cannot be "
+                    "exported for annotation. Rebuild the store. Training is unaffected."
+                )
+            item["usable"] = np.ascontiguousarray(valid[record.offset]).astype(bool)
+            rules = shard["rules"]
+            item["rule_labels"] = np.ascontiguousarray(
+                rules[record.offset] if rules is not None else mask
+            ).astype(np.int64)
+            reviews = shard["reviews"]
+            if reviews is not None:
+                item["review"] = np.ascontiguousarray(reviews[record.offset]).astype(bool)
+        return item
 
     def grid(self):
         """Reconstruct the common grid the shards were cut from."""
@@ -497,6 +552,35 @@ class TileStoreDataset:
             height=size,
         ).corners_wgs84()
 
+    def label_at(self, index: int) -> np.ndarray:
+        """The stored class mask for one tile, ``-1`` where not usable.
+
+        Reads the mask without decoding the imagery, which matters when ranking a whole
+        store rather than inspecting one tile.
+        """
+        record = self.records[index]
+        return np.asarray(self._shards[record.shard]["masks"][record.offset], dtype=np.int64)
+
+    def rule_labels_at(self, index: int) -> np.ndarray:
+        """The rule engine's ungated labels for one tile (``-1`` only where unusable).
+
+        Falls back to the gated mask for stores written before this was persisted, in
+        which case ambiguous pixels read as -1 and simply show as unlabelled.
+        """
+        record = self.records[index]
+        rules = self._shards[record.shard]["rules"]
+        if rules is None:
+            return self.label_at(index)
+        return np.asarray(rules[record.offset], dtype=np.int64)
+
+    def usable_at(self, index: int) -> np.ndarray | None:
+        """Which pixels the satellite swath actually covered, or None if not stored."""
+        record = self.records[index]
+        valid = self._shards[record.shard]["valid"]
+        if valid is None:
+            return None
+        return np.asarray(valid[record.offset], dtype=bool)
+
     def review_at(self, index: int) -> np.ndarray | None:
         """The annotation worklist for one tile.
 
@@ -512,11 +596,14 @@ class TileStoreDataset:
 
     def review_fraction(self) -> float | None:
         """Share of stored pixels awaiting human adjudication, or None if unknown."""
-        total = self.manifest["totals"].get("review_px")
-        if total is None:
+        totals = self.manifest["totals"]
+        total = totals.get("review_px")
+        usable = totals.get("usable_px")
+        if total is None or not usable:
             return None
-        denominator = self.manifest["totals"]["trainable_px"] + total
-        return round(total / max(1, denominator), 5)
+        # Over usable pixels: review is a subset of usable, so the frame's empty
+        # corners must not be in the denominator.
+        return round(total / max(1, usable), 5)
 
     def class_counts(self, indices: Sequence[int] | None = None) -> np.ndarray:
         """Pixel tally per class, optionally restricted to a subset of tiles.
@@ -602,34 +689,91 @@ class TileStoreDataset:
     def dates(self) -> list[str]:
         return [entry["date"] for entry in self.manifest["shards"]]
 
-    def annotation_tiles(self, *, limit: int | None = None) -> list[dict]:
-        """Tiles worth annotating first, ordered by how much a human is needed.
+    def annotation_ranking(
+        self, *, strategy: str = "uncertainty", seed: int = 0
+    ) -> list[tuple[float, int]]:
+        """``(score, tile index)`` for every candidate tile, best first.
 
-        The review mask is the rule engine's own declaration of where it is unsure, so
-        ranking by review density spends annotation effort on the hard cases instead of
-        on tiles the rules already handle confidently.
+        Which tile is "best" depends on what the labels are for, so the strategy is
+        explicit rather than implied:
+
+        * ``uncertainty`` (default) - review density over *usable* ground. Finds what
+          the rule engine cannot call, which is where a human decision improves the
+          training set most per pixel. It is a deliberately **hard-case** selection:
+          a test set built this way measures the model on the hardest pixels in the
+          area, which is defensible but is not a representative sample.
+        * ``reed`` - tiles richest in Phragmites pixels. A test set needs enough of the
+          class it is measuring, and reed is only ~1.8% of this imagery, so an
+          arbitrary selection can leave too few reed pixels for the per-class IoU to
+          mean anything. One run of this project produced "reed IoU 0.0" from 36
+          support pixels, which is a measurement of nothing.
+        * ``random`` - a seeded sample, for a test set that is representative rather
+          than adversarial.
+
+        Exposed separately from :meth:`annotation_tiles` because the exporter needs the
+        tile index to reach the pixels, while the CLI only needs the description.
         """
+        key = strategy.strip().lower()
+        if key not in {"uncertainty", "reed", "random"}:
+            raise AtarraError(
+                f"unknown annotation strategy {strategy!r}; expected 'uncertainty', "
+                "'reed' or 'random'"
+            )
+
+        if key == "random":
+            order = np.random.default_rng(seed).permutation(len(self.records))
+            return [(float(len(order) - rank), int(index)) for rank, index in enumerate(order)]
+
         scored: list[tuple[float, int]] = []
         for index in range(len(self.records)):
+            if key == "reed":
+                labels = self.label_at(index)
+                count = int((labels == PHRAGMITES_CODE).sum())
+                if count > 0:
+                    scored.append((float(count), index))
+                continue
+
             mask = self.review_at(index)
             if mask is None:
                 continue
-            density = float(mask.mean())
+            # Density over *usable* pixels. Dividing by the whole tile instead makes
+            # this ratio a measure of how much of the bounding box the rotated swath
+            # covers -- typically the dominant term -- so a tile that is 98% empty
+            # ground ranks as maximally uncertain.
+            usable = self.usable_at(index)
+            if usable is None:
+                raise AtarraError(
+                    "this store predates the validity mask, so review density cannot be "
+                    "computed without confusing empty swath corners for uncertainty. "
+                    "Rebuild the store, or train with it as-is -- the ranking is only "
+                    "needed for annotation."
+                )
+            labelled = int(usable.sum())
+            if labelled == 0:
+                continue
+            density = float(mask[usable].mean())
             if density > 0:
                 scored.append((density, index))
 
-        scored.sort(reverse=True)
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        return scored
+
+    def annotation_tiles(
+        self, *, limit: int | None = None, strategy: str = "uncertainty", seed: int = 0
+    ) -> list[dict]:
+        """Tiles worth annotating first, described for display."""
+        scored = self.annotation_ranking(strategy=strategy, seed=seed)
         if limit is not None:
             scored = scored[:limit]
-
         return [
             {
                 "key": self.records[index].key,
                 "date": self._shards[self.records[index].shard]["date"],
-                "review_fraction": round(density, 5),
+                "score": round(score, 5),
+                "reed_px": int((self.label_at(index) == PHRAGMITES_CODE).sum()),
                 "corners_wgs84": self.tile_corners_wgs84(index),
             }
-            for density, index in scored
+            for score, index in scored
         ]
 
     def describe(self) -> dict:
@@ -647,6 +791,7 @@ class TileStoreDataset:
             "tiles": len(self.records),
             "class_counts": totals["class_counts"],
             "trainable_px": totals["trainable_px"],
+            "usable_px": totals.get("usable_px"),
             "review_px": totals.get("review_px"),
             "review_fraction": self.review_fraction(),
         }
